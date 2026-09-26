@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+*.local
+*.log
+
+# Real environment files hold secrets (database passwords, API keys). Only
+# the documented template is tracked.
+.env
+.env.*
+!.env.example

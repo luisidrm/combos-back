@@ -1,0 +1,2 @@
+ALTER TABLE "users" DROP CONSTRAINT "users_supertokens_user_id_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "users_tenant_supertokens_user_uq" ON "users" USING btree ("tenant_id","supertokens_user_id");

@@ -1,0 +1,4 @@
+CREATE UNIQUE INDEX "carts_tenant_user_uq" ON "carts" USING btree ("tenant_id","user_id") WHERE "carts"."user_id" IS NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "carts_tenant_guest_token_uq" ON "carts" USING btree ("tenant_id","guest_token") WHERE "carts"."guest_token" IS NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "addresses_one_default_per_recipient" ON "addresses" USING btree ("recipient_id") WHERE "addresses"."is_default" = true AND "addresses"."deleted_at" IS NULL;--> statement-breakpoint
+ALTER TABLE "carts" ADD CONSTRAINT "carts_exactly_one_owner" CHECK (num_nonnulls("carts"."user_id", "carts"."guest_token") = 1);

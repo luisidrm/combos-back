@@ -1,0 +1,75 @@
+# Explicit project name — without this, Compose defaults to the containing
+# folder's basename ("back"), which collides with an unrelated project on
+# this machine that also happens to live in a folder named "back". Every
+# `docker compose` command in this directory now operates only on
+# containers prefixed `combo-shop-*`, never that other project's.
+name: combo-shop
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: combo_shop
+      POSTGRES_PASSWORD: combo_shop
+      POSTGRES_DB: combo_shop
+    ports:
+      # Not 5433 — that falls inside a Windows/Hyper-V dynamic port
+      # exclusion range (`netsh interface ipv4 show excludedportrange
+      # protocol=tcp`), which silently fails the bind. Pick a port clear
+      # of those ranges if this ever needs to move again.
+      - '45432:5432'
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Only runs on a fresh, empty volume. If you're on an existing
+      # volume, apply it manually once — see the file's own header comment.
+      - ./src/db/init:/docker-entrypoint-initdb.d
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6380:6379'
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: combo_shop
+      MINIO_ROOT_PASSWORD: combo_shop_secret
+    ports:
+      - '9010:9000'
+      - '9011:9001'
+    volumes:
+      - minio_data:/data
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - '8026:8025'
+      - '1026:1025'
+
+  # The SuperTokens core server — supertokens-node is only a client SDK for
+  # this, so it has to be running for any auth call to work. Stores its
+  # data in the `supertokens` database on the `db` service (created by
+  # src/db/init/002-supertokens-db.sql), so one pg_dump covers app + auth
+  # data. Without POSTGRESQL_CONNECTION_URI this image silently uses
+  # in-memory storage and loses every user and session on restart.
+  supertokens:
+    image: registry.supertokens.io/supertokens/supertokens-postgresql:latest
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      POSTGRESQL_CONNECTION_URI: postgresql://combo_shop:combo_shop@db:5432/supertokens
+    ports:
+      # High port, same reasoning as db above: 3568 got swallowed by a
+      # Windows dynamic port reservation after a reboot. Not 43567 — that
+      # one is used by the separate Cuban Jobs project's SuperTokens.
+      - '43570:3567'
+
+volumes:
+  db_data:
+  minio_data:

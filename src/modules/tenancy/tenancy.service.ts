@@ -1,0 +1,119 @@
+import { ConflictError, NotFoundError } from '../../core/errors.js';
+import { db } from '../../db/client.js';
+import { isUniqueViolation } from '../../db/errors.js';
+import { mediaService, type PublicPicture } from '../media/index.js';
+import * as tenancyRepo from './tenancy.repo.js';
+import type { CreateTenantInput, Tenant, TenantSettings, UpdateTenantInput } from './tenancy.schema.js';
+
+// What a visitor needs to tell one shop from another (CLAUDE.md section 5):
+// no id, no settings, no timestamps.
+export interface PublicStore {
+  slug: string;
+  name: string;
+  taglineEs: string | null;
+  taglineEn: string | null;
+  descriptionEs: string | null;
+  descriptionEn: string | null;
+  logo: PublicPicture | null;
+}
+
+async function resolveBySlug(slug: string): Promise<Tenant> {
+  const tenant = await tenancyRepo.findBySlug(db, slug);
+  if (!tenant || !tenant.active) {
+    throw new NotFoundError(`No active tenant for slug "${slug}"`);
+  }
+  return tenant;
+}
+
+async function getById(tenantId: string): Promise<Tenant> {
+  const tenant = await tenancyRepo.findById(db, tenantId);
+  if (!tenant) {
+    throw new NotFoundError(`No tenant with id "${tenantId}"`);
+  }
+  return tenant;
+}
+
+async function createTenant(input: CreateTenantInput): Promise<Tenant> {
+  try {
+    return await tenancyRepo.insert(db, input);
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      throw new ConflictError(`A store with slug "${input.slug}" already exists`);
+    }
+    throw err;
+  }
+}
+
+// For maintenance jobs, which run outside any request and so have no tenant of
+// their own: they walk the active tenants and do their work inside each.
+async function listActiveTenantIds(): Promise<string[]> {
+  return tenancyRepo.listActiveIds(db);
+}
+
+async function toPublicStore(tenant: Tenant): Promise<PublicStore> {
+  // A store's logo is a media row owned by the tenant itself: owner_id is the
+  // tenant's own id (see media.schema.ts).
+  const logos = await mediaService.getPublicPictures(tenant.id, 'tenant', [tenant.id]);
+  return {
+    slug: tenant.slug,
+    name: tenant.name,
+    taglineEs: tenant.taglineEs,
+    taglineEn: tenant.taglineEn,
+    descriptionEs: tenant.descriptionEs,
+    descriptionEn: tenant.descriptionEn,
+    logo: logos.get(tenant.id)?.[0] ?? null,
+  };
+}
+
+async function getPublicStore(tenantId: string): Promise<PublicStore> {
+  return toPublicStore(await getById(tenantId));
+}
+
+function readSettings(tenant: Tenant): TenantSettings {
+  const raw = (tenant.settings ?? {}) as { require_delivery_photo?: unknown };
+  return { requireDeliveryPhoto: raw.require_delivery_photo === true };
+}
+
+async function getSettings(tenantId: string): Promise<TenantSettings> {
+  return readSettings(await getById(tenantId));
+}
+
+// Branding and switches an admin controls. Only the fields sent are changed;
+// `null` clears a nullable one.
+async function updateStore(
+  tenantId: string,
+  input: UpdateTenantInput,
+): Promise<PublicStore & { settings: TenantSettings }> {
+  const existing = await getById(tenantId);
+
+  const mergedSettings =
+    input.settings?.requireDeliveryPhoto === undefined
+      ? undefined
+      : { ...(existing.settings as Record<string, unknown>), require_delivery_photo: input.settings.requireDeliveryPhoto };
+
+  // Fields are picked one by one, never spread: this table holds the slug
+  // (a store's identity) and the active flag (whether it is served at all),
+  // which an admin editing branding must never be able to reach — even if a
+  // caller hands this function more than the schema allows.
+  const updated =
+    (await tenancyRepo.update(db, tenantId, {
+      name: input.name,
+      taglineEs: input.taglineEs,
+      taglineEn: input.taglineEn,
+      descriptionEs: input.descriptionEs,
+      descriptionEn: input.descriptionEn,
+      ...(mergedSettings ? { settings: mergedSettings } : {}),
+    })) ?? existing;
+  return { ...(await toPublicStore(updated)), settings: readSettings(updated) };
+}
+
+// The only public surface other modules may depend on (via index.ts).
+export const tenancyService = {
+  resolveBySlug,
+  getById,
+  createTenant,
+  listActiveTenantIds,
+  getPublicStore,
+  getSettings,
+  updateStore,
+};

@@ -1,0 +1,2 @@
+ALTER TABLE "products" ADD COLUMN "slug" varchar(100) NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "products_tenant_slug_uq" ON "products" USING btree ("tenant_id","slug") WHERE "products"."deleted_at" IS NULL;
