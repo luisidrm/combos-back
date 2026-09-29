@@ -71,6 +71,11 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
     ['/auth/signinup/code/consume', '/auth/signin'],
     rateLimit({ name: 'login-ip', limit: 30, windowSeconds: 15 * 60 }),
   );
+  // Password reset: asking for a link sends an email (tight); submitting a
+  // token is guessing-resistant already (long random single-use tokens) but is
+  // still capped.
+  app.post('/auth/user/password/reset/token', rateLimit({ name: 'password-reset-request-ip', limit: 5, windowSeconds: 15 * 60 }));
+  app.post('/auth/user/password/reset', rateLimit({ name: 'password-reset-ip', limit: 20, windowSeconds: 15 * 60 }));
 
   // SuperTokens must sit before express.json() and before your own routes —
   // it handles /auth/* itself.

@@ -1,8 +1,9 @@
-import EmailPassword from 'supertokens-node/recipe/emailpassword/index.js';
-import Session from 'supertokens-node/recipe/session/index.js';
+import supertokens from 'supertokens-node';
+import EmailPassword from 'supertokens-node/recipe/emailpassword';
+import Session from 'supertokens-node/recipe/session';
 import { z } from 'zod';
 import { NotFoundError } from '../../core/errors.js';
-import { initSupertokens } from '../../core/supertokens.js';
+import { initSupertokens, SUPERTOKENS_TENANT, validatePassword } from '../../core/supertokens.js';
 import { identityService } from '../../modules/identity/index.js';
 import { tenancyService } from '../../modules/tenancy/index.js';
 import { sqlClient } from '../client.js';
@@ -18,7 +19,12 @@ const seedEnv = z.object({
   SEED_TENANT_SLUG: z.string().min(1).default('demo'),
   SEED_TENANT_NAME: z.string().min(1).default('Demo Shop'),
   SEED_ADMIN_EMAIL: z.string().email(),
-  SEED_ADMIN_PASSWORD: z.string().min(8),
+  // The same policy the login endpoints enforce — signing up through the
+  // recipe directly, as this script does, would otherwise skip it.
+  SEED_ADMIN_PASSWORD: z.string().superRefine((value, ctx) => {
+    const problem = validatePassword(value);
+    if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem });
+  }),
 });
 
 async function main(): Promise<void> {
@@ -33,9 +39,14 @@ async function main(): Promise<void> {
     return tenancyService.createTenant({ slug: env.SEED_TENANT_SLUG, name: env.SEED_TENANT_NAME });
   });
 
-  const signUp = await EmailPassword.signUp(env.SEED_ADMIN_EMAIL, env.SEED_ADMIN_PASSWORD);
+  const signUp = await EmailPassword.signUp(SUPERTOKENS_TENANT, env.SEED_ADMIN_EMAIL, env.SEED_ADMIN_PASSWORD);
+  // An address may already have a login (this script is re-runnable): find the
+  // email+password one, not e.g. a buyer's passwordless account with the same email.
+  const existing = await supertokens.listUsersByAccountInfo(SUPERTOKENS_TENANT, { email: env.SEED_ADMIN_EMAIL });
   const authUser =
-    signUp.status === 'OK' ? signUp.user : await EmailPassword.getUserByEmail(env.SEED_ADMIN_EMAIL);
+    signUp.status === 'OK'
+      ? signUp.user
+      : existing.find((candidate) => candidate.loginMethods.some((method) => method.recipeId === 'emailpassword'));
   if (!authUser) {
     throw new Error('Could not create or find the SuperTokens user');
   }

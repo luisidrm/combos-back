@@ -13,7 +13,8 @@ fulfilment, notifications and audit have no endpoints yet, and orders only has `
 into a tenant id; every query after that runs inside that tenant (Postgres RLS enforces it).
 The header must look like a slug (`[a-z0-9-]`, ≤ 63) — anything else is a 400 before any lookup.
 Exceptions (no header needed): `/geo/provinces*`, `POST /tenancy`, `/health`, `/ready`, `/metrics`,
-and the `/auth/*` routes other than the two marked below.
+and every `/auth/*` route except `POST /auth/signinup/code/consume` and `POST /auth/signin`
+(marked below) — password reset included, since a password login is global, not per store.
 
 **Who can call it** (the *Auth* column):
 
@@ -58,7 +59,9 @@ SuperTokens' own 401s use `{ "message": "unauthorised" }`. Every response has an
 header (a well-formed one you send is kept); the same id is in the server logs.
 
 **Rate limits** (per client IP unless noted): 300 requests/min overall; cart writes 60/min; asking
-for a login code 10 per 15 min **and** 5 per address per hour; login attempts 30 per 15 min.
+for a login code 10 per 15 min **and** 5 per address per hour; login attempts 30 per 15 min;
+requesting a password reset link 5 per 15 min **and** 3 per address per hour; submitting one
+20 per 15 min.
 
 **Data rules.** Money is integer **cents, USD**. Names are bilingual (`nameEs` required,
 `nameEn` falls back to it). IDs are UUIDs. Soft-deleted rows never appear in responses.
@@ -96,7 +99,25 @@ Body `{ formFields:[{id:"email",value},{id:"password",value}] }`. Checks the pas
 requires a **staff** account (admin or courier, not buyer) for *this* store, otherwise returns
 `WRONG_CREDENTIALS_ERROR` — a valid password with no staff row here looks like a wrong
 password. On success, same session as above with the staff role. Staff accounts are created only
-by `npm run db:seed:admin`; there is no signup, no password reset, and no 2FA yet.
+by `npm run db:seed:admin`; there is no public signup, and no 2FA yet (M5).
+
+### POST `/auth/user/password/reset/token` — staff: request a reset link
+*No tenant header* — a password login is global, and this only needs the address. Body
+`{ formFields:[{id:"email",value}] }`. **Always answers `{status:"OK"}`**, whether or not that
+address has an account — it cannot be used to discover who has one. If it does, an emailed link
+(logged instead, outside production) carries a single-use token valid about an hour. Rate-limited
+per address (5/hour) and per IP (5/15 min), since every call sends a real email.
+
+### POST `/auth/user/password/reset` — staff: submit the new password
+Body `{ formFields:[{id:"password",value}], token }`. The password policy — at least 10
+characters, one letter and one digit — is enforced here too (a weak one is `400` with
+`{status:"FIELD_ERROR", formFields:[{id:"password",error}]}`, and the token is **not** consumed).
+The token is single use; a reused or expired one is `{status:"RESET_PASSWORD_INVALID_TOKEN_ERROR"}`
+(HTTP 200 — check `status`, not the HTTP code, same as every other SuperTokens flow status).
+On success, **every existing session for that account is revoked** — a reset is exactly when
+someone may be locking out a thief, so nothing survives it, including the session that requested
+the reset if there was one. If revoking fails, this answers `500`: a password that changed while
+old sessions might still work is treated as a failure, not a success with a footnote.
 
 ### POST `/auth/session/refresh` / POST `/auth/signout`
 Standard SuperTokens: rotate the session tokens / end the session.

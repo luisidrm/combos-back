@@ -33,6 +33,37 @@ async function sendLoginCode(email: string, code: string): Promise<void> {
   }
 }
 
+// The password-reset link for staff (admin, courier). The link carries a
+// single-use secret token that is valid for about an hour.
+//
+// Same rules as the login code: outside production nothing is emailed and the
+// link goes to the log, so the flow can be tried without a Resend key. That is
+// the one place a token is logged — never in production, and never the address.
+async function sendPasswordResetLink(email: string, link: string): Promise<void> {
+  if (!config.isProduction) {
+    logger.info({ link }, 'Password reset link (dev only, not emailed)');
+    return;
+  }
+
+  const { error } = await resend.emails.send({
+    from: config.emailFrom,
+    to: email,
+    subject: 'Restablecer tu contraseña / Reset your password',
+    text: [
+      'Recibimos una solicitud para restablecer tu contraseña. Usa este enlace (vale por aproximadamente una hora):',
+      link,
+      '',
+      'We received a request to reset your password. Use this link (valid for about an hour):',
+      link,
+      '',
+      'Si no lo pediste, ignora este mensaje: tu contraseña no cambia. / If you did not request it, ignore this message: your password stays the same.',
+    ].join('\n'),
+  });
+  if (error) {
+    throw new InternalError(`Could not send password reset email: ${error.message}`);
+  }
+}
+
 // Business logic for Resend templates, wa.me deep link helpers.
 // This is the ONLY public surface other modules may import (via index.ts).
-export const notificationsService = { sendLoginCode };
+export const notificationsService = { sendLoginCode, sendPasswordResetLink };

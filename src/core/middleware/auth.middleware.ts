@@ -105,8 +105,16 @@ export function createAuthMiddleware(deps: AuthDeps) {
 }
 
 export const { requireAuth, optionalAuth } = createAuthMiddleware({
-  verify: verifySession(),
-  verifyOptional: verifySession({ sessionRequired: false }),
+  // checkDatabase asks the SuperTokens core whether this session's handle is
+  // still valid, instead of only checking the access token's signature and
+  // expiry. Without it, a revoked session (Session.revokeAllSessionsForUser,
+  // called on password reset) keeps its old access token working until that
+  // token's own expiry — the database record says "revoked" but nothing
+  // consults it. This costs one extra call to the SuperTokens core per
+  // authenticated request, on top of the `loadUser` lookup below; both exist
+  // for the same reason — a token is what someone WAS, not what they are now.
+  verify: verifySession({ checkDatabase: true }),
+  verifyOptional: verifySession({ sessionRequired: false, checkDatabase: true }),
   // Loaded at call time, not imported at the top of this file: the identity
   // module's own routes import THIS file, and a static import back would make
   // a cycle in which a route file can see `requireAuth` still undefined,
