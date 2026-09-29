@@ -1,11 +1,12 @@
 import { sql } from 'drizzle-orm';
 import type postgres from 'postgres';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { NotFoundError, ValidationError } from '../../core/errors.js';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { startTestDatabase, type TestDatabase } from '../../db/testing/test-database.js';
 import type { cartService as cartServiceType } from '../cart/index.js';
 import type { catalogService as catalogServiceType } from '../catalog/index.js';
 import type { geoService as geoServiceType } from '../geo/index.js';
+import type { paymentsService as paymentsServiceType } from '../payments/index.js';
 import { createAddressSchema, createRecipientSchema, updateAddressSchema } from './orders.schema.js';
 import type { ordersService as ordersServiceType } from './index.js';
 
@@ -25,6 +26,7 @@ describe('orders module: the address book', () => {
   let orders: typeof ordersServiceType;
   let cart: typeof cartServiceType;
   let catalog: typeof catalogServiceType;
+  let payments: typeof paymentsServiceType;
   let geo: typeof geoServiceType;
 
   const tenantA = crypto.randomUUID();
@@ -80,6 +82,7 @@ describe('orders module: the address book', () => {
     orders = (await import('./index.js')).ordersService;
     cart = (await import('../cart/index.js')).cartService;
     catalog = (await import('../catalog/index.js')).catalogService;
+    payments = (await import('../payments/index.js')).paymentsService;
     geo = (await import('../geo/index.js')).geoService;
   });
 
@@ -417,6 +420,347 @@ describe('orders module: the address book', () => {
     it("refuses a recipient from another store", async () => {
       const owner = await buyerWithAddress(vedado, havana);
       await expect(orders.quote(tenantB, owner.buyer, owner)).rejects.toBeInstanceOf(NotFoundError);
+    });
+  });
+
+  describe('checkout and the order state machine', () => {
+    // Its own municipality, not vedado/centro — both already have zones from
+    // the quote describe block above, and describe blocks in this file share
+    // one database and one set of outer-scope ids, not a fresh fixture each.
+    let checkoutMunicipality: string;
+    // audit_log.actor_user_id is a real uuid column — a human-readable
+    // placeholder string would fail at the database, not just be unrealistic.
+    const adminUser = crypto.randomUUID();
+
+    async function liveProduct(name: string, priceCents: number, overrides: Record<string, unknown> = {}) {
+      const product = await catalog.createProduct(tenantA, { nameEs: name, priceCents, unitLabel: '1 lb', ...overrides });
+      const key = `public/${tenantA}/product/${product.id}/${crypto.randomUUID()}`;
+      await adminSql`
+        INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
+        VALUES (${tenantA}, 'product', ${product.id}, ${`${tenantA}/product/${product.id}/o.jpg`},
+                ${key + '.thumb.webp'}, ${key + '.card.webp'}, ${key + '.full.webp'}, 'ready')`;
+      await catalog.activateProduct(tenantA, product.id);
+      return product;
+    }
+
+    // checkout() looks up the buyer's own users row for their email (to pass
+    // to the payment provider) — a bare random id, fine for cart/recipients
+    // which only ever use it as a soft reference, isn't enough here.
+    async function insertBuyer(): Promise<string> {
+      const id = crypto.randomUUID();
+      await adminSql`
+        INSERT INTO users (id, tenant_id, supertokens_user_id, email, role)
+        VALUES (${id}, ${tenantA}, ${crypto.randomUUID()}, ${`buyer-${id}@example.com`}, 'buyer')`;
+      return id;
+    }
+
+    async function buyerWithCart(productId: string, quantity = 1) {
+      const buyer = await insertBuyer();
+      await cart.addItem(tenantA, { userId: buyer }, { productId, quantity });
+      const created = await orders.createRecipient(
+        tenantA,
+        buyer,
+        recipient({ address: address({ municipalityId: checkoutMunicipality }) }),
+      );
+      return { buyer, recipientId: created.id, addressId: created.addresses[0]?.id as string };
+    }
+
+    async function checkoutAs(provider: 'manual' | 'tropipay', productId: string, quantity = 1) {
+      const { buyer, recipientId, addressId } = await buyerWithCart(productId, quantity);
+      const result = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider });
+      return { buyer, ...result };
+    }
+
+    beforeAll(async () => {
+      checkoutMunicipality = await insertMunicipality(havana, 'Playa');
+      await geo.createZone(tenantA, { municipalityId: checkoutMunicipality, feeCents: 500 });
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    describe('placing an order', () => {
+      it('creates a pending_payment order with snapshot line items, a pending payment, and clears the cart', async () => {
+        const arroz = await liveProduct('Checkout Arroz', 950);
+        const { buyer, order, checkoutUrl } = await checkoutAs('manual', arroz.id, 2);
+
+        expect(order.status).toBe('pending_payment');
+        expect(order.orderNumber).toMatch(/^ORD-[A-Z0-9]{8}$/);
+        expect(order).toMatchObject({ subtotalCents: 1900, deliveryFeeCents: 500, totalCents: 2400, currency: 'USD' });
+        expect(order.items).toEqual([
+          expect.objectContaining({ productId: arroz.id, productNameEs: 'Checkout Arroz', quantity: 2, unitPriceCents: 950, lineTotalCents: 1900 }),
+        ]);
+        // Manual transfer has no redirect (see ManualTransferProvider) — an
+        // empty provider URL is surfaced as no URL at all, not an empty string.
+        expect(checkoutUrl).toBeNull();
+
+        expect((await cart.getCart(tenantA, { userId: buyer })).items).toEqual([]);
+
+        const [payment] = await adminSql`select id, provider, status, amount_cents, external_payment_id from payments where order_id = ${order.id}`;
+        // ManualTransferProvider's "external" id IS our own payment id — see
+        // its file — so attaching it is a same-value round trip, but it still
+        // proves startProviderCheckout ran the whole way through, including
+        // the identityService.getById lookup that needs a real buyer row.
+        expect(payment).toMatchObject({ provider: 'manual', status: 'pending', amount_cents: 2400, external_payment_id: payment?.id });
+
+        const [audit] = await adminSql`select action from audit_log where entity_id = ${order.id} and entity_type = 'order'`;
+        expect(audit?.action).toBe('order.placed');
+      });
+
+      it('snapshots the recipient and address at the moment of the order, immune to later edits', async () => {
+        const p = await liveProduct('Checkout Snapshot', 500);
+        const { buyer, recipientId, addressId } = await buyerWithCart(p.id);
+        const { order } = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual' });
+
+        await orders.updateRecipient(tenantA, buyer, recipientId, { fullName: 'Nombre Cambiado' });
+        const reread = await orders.getOrderForBuyer(tenantA, buyer, order.id);
+        expect(reread.recipientNameSnapshot).toBe('María Pérez');
+      });
+
+      it('refuses to check out an empty or unresolvable cart, naming the blocker', async () => {
+        const { buyer, recipientId, addressId } = await buyerWithCart((await liveProduct('Checkout Unused', 100)).id);
+        await cart.clearCart(tenantA, { userId: buyer });
+        const failed = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual' }).catch((err: unknown) => err);
+        expect(failed).toBeInstanceOf(ConflictError);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'EMPTY_CART' });
+      });
+
+      it('is not fooled by a soft-deleted address that still satisfies the foreign key', async () => {
+        const p = await liveProduct('Checkout Deleted Address', 300);
+        const buyer = crypto.randomUUID();
+        await cart.addItem(tenantA, { userId: buyer }, { productId: p.id, quantity: 1 });
+        const created = await orders.createRecipient(tenantA, buyer, recipient({ address: address({ municipalityId: checkoutMunicipality }) }));
+        const addressId = created.addresses[0]?.id as string;
+
+        // quote() (called first, inside checkout) still sees it; delete it
+        // right after — the FK to addresses.id would not itself stop this.
+        await adminSql`update addresses set deleted_at = now() where id = ${addressId}`;
+
+        await expect(orders.checkout(tenantA, buyer, { recipientId: created.id, addressId, provider: 'manual' })).rejects.toBeInstanceOf(
+          NotFoundError,
+        );
+      });
+
+      it('generates a fresh order number for every order', async () => {
+        const p = await liveProduct('Checkout Numbers', 200);
+        const first = await checkoutAs('manual', p.id);
+        const second = await checkoutAs('manual', p.id);
+        expect(first.order.orderNumber).not.toBe(second.order.orderNumber);
+      });
+    });
+
+    describe('reading orders', () => {
+      it('lets a buyer list and read their own orders, newest first', async () => {
+        const p = await liveProduct('Checkout Reading', 400);
+        const buyer = await insertBuyer();
+        const orderIds: string[] = [];
+        for (let i = 0; i < 2; i += 1) {
+          await cart.addItem(tenantA, { userId: buyer }, { productId: p.id, quantity: 1 });
+          const created = await orders.createRecipient(tenantA, buyer, recipient({ address: address({ municipalityId: checkoutMunicipality }) }));
+          const { order } = await orders.checkout(tenantA, buyer, {
+            recipientId: created.id,
+            addressId: created.addresses[0]?.id as string,
+            provider: 'manual',
+          });
+          orderIds.push(order.id);
+        }
+        const list = await orders.listOrdersForBuyer(tenantA, buyer);
+        expect(list.map((o) => o.id).slice(0, 2)).toEqual([...orderIds].reverse());
+      });
+
+      it("refuses a buyer another buyer's order, and an admin can still read it", async () => {
+        const p = await liveProduct('Checkout Privacy', 400);
+        const { order } = await checkoutAs('manual', p.id);
+        const stranger = crypto.randomUUID();
+        await expect(orders.getOrderForBuyer(tenantA, stranger, order.id)).rejects.toBeInstanceOf(NotFoundError);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).id).toBe(order.id);
+      });
+
+      it("hides one store's orders from another", async () => {
+        const p = await liveProduct('Checkout Cross Tenant', 400);
+        const { order } = await checkoutAs('manual', p.id);
+        await expect(orders.getOrderForAdmin(tenantB, order.id)).rejects.toBeInstanceOf(NotFoundError);
+        expect((await orders.listOrdersForAdmin(tenantB, {})).map((o) => o.id)).not.toContain(order.id);
+      });
+
+      it('filters the admin list by status', async () => {
+        const p = await liveProduct('Checkout Filter', 400);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminCancel(tenantA, adminUser, order.id);
+        const cancelled = await orders.listOrdersForAdmin(tenantA, { status: 'cancelled' });
+        expect(cancelled.map((o) => o.id)).toContain(order.id);
+        expect((await orders.listOrdersForAdmin(tenantA, { status: 'paid' })).map((o) => o.id)).not.toContain(order.id);
+      });
+    });
+
+    describe('the state machine', () => {
+      it('follows the happy path: pending_payment -> paid -> preparing -> refunded', async () => {
+        const p = await liveProduct('State Happy', 600);
+        const { order } = await checkoutAs('manual', p.id);
+
+        const paid = await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        expect(paid.status).toBe('paid');
+        expect(paid.paidAt).not.toBeNull();
+
+        const preparing = await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+        expect(preparing.status).toBe('preparing');
+
+        const refunded = await orders.refund(tenantA, adminUser, order.id, 'buyer changed their mind');
+        expect(refunded.status).toBe('refunded');
+
+        const [payment] = await adminSql`select status from payments where order_id = ${order.id}`;
+        expect(payment?.status).toBe('refunded');
+      });
+
+      it('refuses an illegal transition, naming what is and is not allowed', async () => {
+        const p = await liveProduct('State Illegal', 600);
+        const { order } = await checkoutAs('manual', p.id);
+
+        const failed = await orders.adminMarkPreparing(tenantA, adminUser, order.id).catch((err: unknown) => err);
+        expect(failed).toBeInstanceOf(ConflictError);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'ILLEGAL_TRANSITION', from: 'pending_payment', to: 'preparing' });
+      });
+
+      it('is idempotent: reaching a status it is already at is a no-op, not an error', async () => {
+        const p = await liveProduct('State Idempotent', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+
+        // handlePaymentConfirmed is exactly what the worker's event subscriber
+        // calls — simulating a redelivered payment.paid event here.
+        await expect(ordersServiceHandlePaymentConfirmed(order.id)).resolves.toBeUndefined();
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('paid');
+      });
+
+      async function ordersServiceHandlePaymentConfirmed(orderId: string): Promise<void> {
+        const mod = await import('./orders.service.js');
+        return mod.ordersService.handlePaymentConfirmed(tenantA, orderId);
+      }
+
+      it('lets a buyer cancel only before paying, and an admin override the same rule', async () => {
+        const p = await liveProduct('State Cancel', 600);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+
+        const paidOrder = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, paidOrder.order.id);
+        const buyerCancelPaid = await orders
+          .cancelByBuyer(tenantA, paidOrder.buyer, paidOrder.order.id)
+          .catch((err: unknown) => err);
+        expect(buyerCancelPaid).toBeInstanceOf(ConflictError);
+
+        const cancelled = await orders.cancelByBuyer(tenantA, buyer, order.id, 'changed my mind');
+        expect(cancelled.status).toBe('cancelled');
+        expect(cancelled.cancelledAt).not.toBeNull();
+      });
+
+      it('refuses to refund an order that was never paid, without calling the provider', async () => {
+        const p = await liveProduct('State Refund Guard', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await expect(orders.refund(tenantA, adminUser, order.id)).rejects.toBeInstanceOf(ConflictError);
+      });
+    });
+
+    describe('retrying a failed checkout attempt', () => {
+      it('re-attempts the provider call for a still-pending order', async () => {
+        const p = await liveProduct('Retry Basic', 600);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const { checkoutUrl } = await orders.retryPayment(tenantA, buyer, order.id);
+        expect(checkoutUrl).toBeNull(); // manual transfer never has one, retried or not
+      });
+
+      it('refuses to retry an order that is no longer pending', async () => {
+        const p = await liveProduct('Retry Guard', 600);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await expect(orders.retryPayment(tenantA, buyer, order.id)).rejects.toBeInstanceOf(ConflictError);
+      });
+    });
+
+    describe('reconciliation', () => {
+      const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+      it('leaves a fresh pending order untouched', async () => {
+        const p = await liveProduct('Reconcile Fresh', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        const result = await orders.reconcilePendingPayments(tenantA);
+        expect(result.checked).toBe(0);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('pending_payment');
+      });
+
+      it('self-heals a tropipay order the provider now reports as paid', async () => {
+        const p = await liveProduct('Reconcile Selfheal', 600);
+        const { order, paymentId } = await checkoutTropipay(p.id);
+        await adminSql`update orders set placed_at = ${daysAgo(2)} where id = ${order.id}`;
+        await adminSql`update payments set external_payment_id = 'ext-1' where id = ${paymentId}`;
+
+        vi.spyOn(payments.getProvider('tropipay'), 'getStatus').mockResolvedValue('paid');
+        const result = await orders.reconcilePendingPayments(tenantA);
+
+        expect(result.selfHealed).toBe(1);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('paid');
+      });
+
+      it('cancels a manual-transfer order past 72h without ever trying to poll it', async () => {
+        const p = await liveProduct('Reconcile Manual Cancel', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await adminSql`update orders set placed_at = ${daysAgo(4)} where id = ${order.id}`;
+
+        const getStatusSpy = vi.spyOn(payments.getProvider('tropipay'), 'getStatus');
+        const result = await orders.reconcilePendingPayments(tenantA);
+
+        expect(getStatusSpy).not.toHaveBeenCalled();
+        expect(result.cancelled).toBe(1);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('cancelled');
+        const [payment] = await adminSql`select status from payments where order_id = ${order.id}`;
+        expect(payment?.status).toBe('failed');
+      });
+
+      it('does not cancel a manual-transfer order that is merely old enough to poll, not yet 72h', async () => {
+        const p = await liveProduct('Reconcile Manual Wait', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await adminSql`update orders set placed_at = ${daysAgo(1.5)} where id = ${order.id}`;
+
+        const result = await orders.reconcilePendingPayments(tenantA);
+        expect(result.cancelled).toBe(0);
+        expect(result.selfHealed).toBe(0);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('pending_payment');
+      });
+
+      it("does not reach into another tenant's stale orders", async () => {
+        const p = await liveProduct('Reconcile Cross Tenant', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await adminSql`update orders set placed_at = ${daysAgo(4)} where id = ${order.id}`;
+
+        const resultForB = await orders.reconcilePendingPayments(tenantB);
+        expect(resultForB.checked).toBe(0);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('pending_payment');
+      });
+
+      async function checkoutTropipay(productId: string) {
+        vi.spyOn(payments.getProvider('tropipay'), 'createCheckout').mockResolvedValue({
+          redirectUrl: 'https://pay.example/x',
+          externalPaymentId: 'ext-pending',
+        });
+        const { buyer, order } = await checkoutAs('tropipay', productId);
+        const [payment] = await adminSql`select id from payments where order_id = ${order.id}`;
+        return { buyer, order, paymentId: payment?.id as string };
+      }
+    });
+
+    describe('cross-tenant isolation of orders and order_items', () => {
+      it("returns nothing when tenant B reads tenant A's order or its items", async () => {
+        const p = await liveProduct('Isolation Orders', 600);
+        const { order } = await checkoutAs('manual', p.id);
+        await expect(orders.getOrderForAdmin(tenantB, order.id)).rejects.toBeInstanceOf(NotFoundError);
+
+        const rows = await adminSql`select count(*)::int as n from order_items where order_id = ${order.id}`;
+        expect(rows[0]?.n).toBeGreaterThan(0); // sanity: the items really exist
+        // A tenant-B-scoped read (RLS-enforced) sees none of them.
+        const { withTenant } = await import('../../db/client.js');
+        const refused = await withTenant(tenantB, (tx) => tx.execute(sql`select * from order_items where order_id = ${order.id}`));
+        expect((refused as unknown as unknown[]).length).toBe(0);
+      });
     });
   });
 });

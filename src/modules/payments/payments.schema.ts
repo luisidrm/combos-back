@@ -1,8 +1,16 @@
 import { integer, jsonb, numeric, pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
+import { z } from 'zod';
 import { tenantIsolationPolicy } from '../../db/rls.js';
 
 export const paymentStatuses = ['pending', 'paid', 'failed', 'refunded'] as const;
 export type PaymentStatus = (typeof paymentStatuses)[number];
+
+// The single source of truth for which providers exist — payments.service's
+// registry, orders' checkout schema, and everything else all reference this
+// one list rather than repeating the literal.
+export const providerNames = ['tropipay', 'manual'] as const;
+export type ProviderName = (typeof providerNames)[number];
+export const providerNameSchema = z.enum(providerNames);
 
 export const payments = pgTable(
   'payments',

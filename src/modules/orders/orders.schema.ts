@@ -202,5 +202,43 @@ export const quoteSchema = z.object({
 });
 export type QuoteInput = z.infer<typeof quoteSchema>;
 
-export const recipientParamSchema =z.object({ id: z.string().uuid() });
+export const recipientParamSchema = z.object({ id: z.string().uuid() });
 export const addressParamSchema = z.object({ id: z.string().uuid(), addressId: z.string().uuid() });
+
+// --- checkout / order management ------------------------------------------
+
+// Kept as its own literal, not imported from payments/index.ts: schema files
+// are meant to be side-effect-free leaves (just table defs + zod), and
+// payments/index.ts re-exports payments.service.ts, which statically imports
+// db/client.ts — importing it here would make loading this schema quietly
+// open a database connection pool as a side effect, which is exactly the
+// kind of thing that breaks the test setup that relies on db/client.ts being
+// loaded only after startTestDatabase() has set the real DATABASE_URL (see
+// db/testing/test-database.ts). payments.schema.ts's providerNames is the
+// source of truth this mirrors; keep the two in sync.
+const providerNames = ['tropipay', 'manual'] as const;
+
+export const checkoutSchema = z.object({
+  recipientId: z.string().uuid(),
+  addressId: z.string().uuid(),
+  provider: z.enum(providerNames),
+  giftMessage: z.string().trim().max(500).nullable().optional(),
+  buyerNotes: z.string().trim().max(1000).nullable().optional(),
+});
+export type CheckoutInput = z.infer<typeof checkoutSchema>;
+
+export const orderIdParamSchema = z.object({ id: z.string().uuid() });
+
+export const adminOrdersQuerySchema = z.object({
+  status: z.enum(orderStatuses).optional(),
+});
+
+// Every field here is optional, so a client that sends no body at all (a
+// perfectly reasonable "just do it, no note") should not be rejected —
+// .default({}) makes an entirely absent body parse the same as `{}`, rather
+// than failing validation because there was no object to check fields on.
+export const transitionNoteSchema = z
+  .object({
+    note: z.string().trim().max(1000).optional(),
+  })
+  .default({});

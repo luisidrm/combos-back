@@ -1,9 +1,9 @@
 # Combo Shop API — endpoint reference
 
-What every endpoint is for and what happens inside it. Reflects the code as of the M2
-backend (geo, cart, address book, checkout pricing) after the review fixes. Payments,
-fulfilment, notifications and audit have no endpoints yet, and orders only has `/orders/quote`
-(placing an order is M3).
+What every endpoint is for and what happens inside it. Reflects the code as of the M3 backend:
+checkout, the order state machine, both payment providers, webhooks, reconciliation. Fulfilment
+(couriers, delivery marking) and notifications have no endpoints yet — that's M4. `audit_log` is
+written to internally by every state transition but has no read endpoint of its own yet.
 
 ## Conventions
 
@@ -422,13 +422,12 @@ oldest remaining address becomes the default.
 
 ---
 
-## 9. Checkout pricing — `/orders`
+## 9. Orders and checkout — `/orders`
 
 ### POST `/orders/quote` — price a checkout (Buyer)
 Body `{ recipientId, addressId }` (both must be the caller's own). Read-only: nothing is reserved
-or created — placing the order and its frozen snapshot are M3. It takes the buyer's cart **as it
-is right now** and adds the flat fee of the delivery zone that covers the address's municipality
-(CLAUDE.md §10: total = subtotal + zone fee). Returns:
+or created. It takes the buyer's cart **as it is right now** and adds the flat fee of the delivery
+zone that covers the address's municipality (CLAUDE.md §10: total = subtotal + zone fee). Returns:
 
 ```
 { cart: CartView,                     // the same authoritative cart as GET /cart
@@ -438,13 +437,80 @@ is right now** and adds the flat fee of the delivery zone that covers the addres
   blockers: ("EMPTY_CART" | "CART_HAS_ISSUES" | "NO_DELIVERY_ZONE")[] }
 ```
 `blockers` is why a checkout cannot go ahead, so the UI can explain instead of only disabling a
-button: the cart is empty; a line is unavailable/out of stock/over its limit; or the store has no
-*active* zone for that municipality (then `delivery` is `null`, the fee is 0, and `canCheckout`
-is false). 404 if the recipient or address is not the caller's.
+button. 404 if the recipient or address is not the caller's.
+
+**Shapes.** `Order = { id, orderNumber, status, recipientNameSnapshot, recipientPhonesSnapshot,
+addressSnapshot, giftMessage, buyerNotes, currency, subtotalCents, deliveryFeeCents, totalCents,
+placedAt, paidAt, deliveredAt, cancelledAt }`. `OrderDetail = Order & { items: [{ productId,
+productNameEs, unitLabel, unitPriceCents, quantity, lineTotalCents }] }` — everything here is a
+**frozen snapshot** taken at checkout; editing the product or the address book afterwards never
+changes a past order (CLAUDE.md §5).
+
+### POST `/orders/checkout` — place the order (Buyer)
+Body `{ recipientId, addressId, provider: "tropipay"|"manual", giftMessage?, buyerNotes? }`. Re-runs
+the same pricing as `/quote`; `409` with the same `blockers` shape if it still can't go ahead.
+On success (201): creates the order in **`pending_payment`**, snapshots every cart line into
+`order_items`, creates a matching `pending` payment row, and clears the buyer's cart — then calls
+the chosen provider to start a checkout session. Returns
+`{ order: OrderDetail, checkoutUrl: string | null }`. `checkoutUrl` is `null` for `manual` (there is
+nothing to redirect to — show the buyer payment instructions instead) and also `null` if the
+provider call itself failed (network blip, provider outage) — the order still exists either way;
+retry with the endpoint below. The order number looks like `ORD-8FQXH2KM` (no `0/O/1/I/L`, so it
+reads back over the phone without ambiguity).
+
+### GET `/orders` — the buyer's own orders (Buyer)
+`Order[]`, newest first.
+
+### GET `/orders/:id` — one order, with its line items (Buyer)
+`OrderDetail`. 404 for another buyer's order.
+
+### POST `/orders/:id/retry-payment` — try starting the checkout session again (Buyer)
+Only for an order still in `pending_payment`. Returns `{ checkoutUrl: string | null }`.
+
+### POST `/orders/:id/cancel` — buyer cancels (Buyer)
+Body `{ note? }` (or no body at all). **Only while `pending_payment`** — once money has moved,
+undoing it is a refund (admin-only), not a cancel; `409 ILLEGAL_TRANSITION` otherwise.
+
+### Admin
+`GET /orders/admin/list?status=` · `GET /orders/admin/:id` — same shapes as above, any buyer's
+order in the store.
+
+`POST /orders/admin/:id/mark-paid` — body `{ note? }`. A manual override ("I can see in my
+TropiPay dashboard/bank that this was paid") for **any** provider, not only `manual` — covers a
+missed webhook. Flips the payment row alongside the order, in one transaction.
+
+`POST /orders/admin/:id/preparing` — `paid` → `preparing`.
+
+`POST /orders/admin/:id/cancel` — admin override of the buyer's own cancel rule (still only from
+`pending_payment`).
+
+`POST /orders/admin/:id/refund` — body `{ note? }`. Full refund only, always the order's own
+total. Calls the provider **before** writing anything; a provider-side rejection leaves the order
+untouched. On success: payment → `refunded`, order → `refunded` (from any state that allows it —
+see CLAUDE.md §6's transition table).
+
+**Every transition is illegal-transition-checked and idempotent.** An order already at the target
+status is returned unchanged (200), not an error — a retried webhook or admin click is a no-op,
+not a failure. An actually-illegal move (e.g. `preparing` an order still `pending_payment`) is
+`409` with `details: { reason: "ILLEGAL_TRANSITION", from, to, allowed }`.
 
 ---
 
-## 10. Ops
+## 10. Payment webhooks — `/payments`
+
+### POST `/payments/webhooks/:provider`
+**Not a client-facing endpoint** — called by the payment provider's own servers, not by the app.
+No `x-tenant-slug` (a provider doesn't know it); the tenant is recovered from a reference embedded
+in the checkout session instead (CLAUDE.md §6). Signature-verified before anything is trusted;
+idempotent on the provider's own event id; never trusts the reported amount over what the order
+was actually priced at. `:provider` must be `tropipay` or `manual` (404 otherwise) — `manual` has
+no real webhook handler and always answers 409, since manual-transfer status only ever changes via
+the admin `mark-paid`/`refund` actions above. Always 200 once verified, whatever happened next (a
+duplicate or a mismatch is logged and acknowledged, not retried).
+
+---
+
+## 11. Ops
 
 **GET `/health`** — `{status:"ok"}`; liveness only, touches nothing.
 
@@ -460,12 +526,19 @@ production it is **off** unless a token is set; in development it is open.
 
 ## Typical journeys
 
-**Buyer, first order (today: up to a priced quote).** `GET /tenancy/current` (store header) →
-`GET /catalog/products` → `GET /catalog/products/:slug` → `POST /cart/items` (guest; keep
-`guestToken`) → keep shopping with `x-cart-token` → `POST /auth/signinup/code` + `/consume` to log
-in → `POST /cart/merge` with the old token (guest cart absorbed) → `GET /geo/provinces` →
-`…/municipalities` → `POST /recipients` with an address → `POST /orders/quote` (total with
-delivery) → *(M3: place the order, pay).*
+**Buyer, first order.** `GET /tenancy/current` (store header) → `GET /catalog/products` →
+`GET /catalog/products/:slug` → `POST /cart/items` (guest; keep `guestToken`) → keep shopping with
+`x-cart-token` → `POST /auth/signinup/code` + `/consume` to log in → `POST /cart/merge` with the
+old token (guest cart absorbed) → `GET /geo/provinces` → `…/municipalities` → `POST /recipients`
+with an address → `POST /orders/quote` (total with delivery) → `POST /orders/checkout` → if
+`checkoutUrl` is set, send the buyer there to pay; if `null` and the provider is `manual`, show
+payment instructions; if `null` for any other reason, `POST /orders/:id/retry-payment` → the
+provider's webhook (or an admin's `mark-paid`) moves the order to `paid` → `GET /orders/:id` to
+show the buyer their receipt.
+
+**Admin, fulfilling an order.** `GET /orders/admin/list?status=paid` → `POST
+/orders/admin/:id/preparing` → *(M4: mark out for delivery / delivered, once fulfilment ships)*.
+If a buyer asks for their money back: `POST /orders/admin/:id/refund`.
 
 **Admin, adding a product.** `POST /auth/signin` → `POST /catalog/categories` → `POST
 /catalog/products` (draft) → `POST /media/upload-url` → POST the file to MinIO with the returned

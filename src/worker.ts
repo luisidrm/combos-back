@@ -7,10 +7,12 @@ import { logger } from './core/logger.js';
 import { cartService } from './modules/cart/index.js';
 import { registerCatalogWorker } from './modules/catalog/index.js';
 import { mediaService, registerMediaWorker } from './modules/media/index.js';
+import { registerOrdersWorker, runOrderReconciliation } from './modules/orders/index.js';
 import { tenancyService } from './modules/tenancy/index.js';
 
 registerMediaWorker();
 registerCatalogWorker();
+registerOrdersWorker();
 
 // Housekeeping with no request behind it: discard abandoned uploads and
 // stale guest carts. A job has no tenant of its own, so it walks the active
@@ -26,6 +28,8 @@ async function runMaintenance(): Promise<void> {
     try {
       abandonedUploads += await mediaService.sweepStalePending(tenantId);
       staleCarts += await cartService.purgeStaleGuestCarts(tenantId);
+      // The 24h self-heal / 72h auto-cancel pass (CLAUDE.md section 6).
+      await runOrderReconciliation(tenantId);
     } catch (err) {
       // One tenant's failure must not stop the others being tidied.
       logger.error({ err, tenantId }, 'Maintenance failed for a tenant');

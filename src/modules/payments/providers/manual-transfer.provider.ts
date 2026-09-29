@@ -1,25 +1,49 @@
 import type { Request } from 'express';
-import type { CheckoutSession, Order, PaymentEvent, PaymentProvider, PaymentStatus, RefundResult } from '../payments.provider.js';
+import { InternalError } from '../../../core/errors.js';
+import type {
+  CheckoutOrder,
+  CheckoutSession,
+  PaymentProvider,
+  PaymentStatus,
+  RefundResult,
+  WebhookResult,
+} from '../payments.provider.js';
 
-// Buyer transfers directly (bank/remittance) and an admin confirms receipt
-// manually from the admin panel. No webhook to verify — status transitions
-// are admin-driven, so verifyWebhook is unreachable in normal operation.
-// TODO(M3): implement against the payments/payment_events tables once they
-// land.
+// The buyer transfers directly (bank/remittance/WhatsApp-arranged cash) and
+// an admin confirms receipt from the admin panel — there is no external
+// payment gateway here, no redirect, and no webhook. Every method below is
+// correspondingly a no-op or a stub: our own `payments.status` column, kept
+// current by orders.service's admin-facing mark-paid/refund actions, IS the
+// status. Nothing external to poll or verify, so nothing here touches the
+// database (ordersService.reconciliation skips calling getStatus for this
+// provider entirely, rather than forcing a tenant-less read through it —
+// see its comment for why).
 export class ManualTransferProvider implements PaymentProvider {
-  async createCheckout(_order: Order): Promise<CheckoutSession> {
-    throw new Error('ManualTransferProvider.createCheckout not implemented yet (M3)');
+  // No redirect: the buyer stays on our own "how to pay" screen. Our own
+  // payment id doubles as the reference to put in the transfer memo — there
+  // is no separate provider-side id to have instead.
+  async createCheckout(order: CheckoutOrder): Promise<CheckoutSession> {
+    return { redirectUrl: '', externalPaymentId: order.paymentId };
   }
 
-  async verifyWebhook(_req: Request): Promise<PaymentEvent> {
-    throw new Error('ManualTransferProvider has no webhooks — status is set by an admin action');
+  // Never called in normal operation — no webhook route is registered for
+  // this provider (see payments.routes.ts). Present only to satisfy the
+  // interface.
+  async verifyWebhook(_req: Request): Promise<WebhookResult> {
+    throw new InternalError('ManualTransferProvider has no webhooks — status is set by an admin action');
   }
 
-  async getStatus(_paymentId: string): Promise<PaymentStatus> {
-    throw new Error('ManualTransferProvider.getStatus not implemented yet (M3)');
+  // Never called — see the class comment.
+  async getStatus(_externalPaymentId: string): Promise<PaymentStatus> {
+    throw new InternalError('ManualTransferProvider has no external status to poll');
   }
 
-  async refund(_paymentId: string, _amountCents: number): Promise<RefundResult> {
-    throw new Error('ManualTransferProvider.refund not implemented yet (M3)');
+  // A manual transfer is refunded manually too: the operator sends the
+  // money back themselves and marks it in the admin panel, which updates
+  // the order/payment directly (orders.service's refund()) — there is
+  // nothing for a provider to call out to, so this immediately reports
+  // done rather than pretending to start an asynchronous process.
+  async refund(_externalPaymentId: string, _amountCents: number): Promise<RefundResult> {
+    return { refundId: '', status: 'completed' };
   }
 }

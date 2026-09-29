@@ -77,6 +77,11 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
   app.post('/auth/user/password/reset/token', rateLimit({ name: 'password-reset-request-ip', limit: 5, windowSeconds: 15 * 60 }));
   app.post('/auth/user/password/reset', rateLimit({ name: 'password-reset-ip', limit: 20, windowSeconds: 15 * 60 }));
 
+  // Payment webhooks need their exact raw bytes to verify a signature — once
+  // express.json() below has parsed and discarded them, they cannot be
+  // recovered, so this has to run first and only for this one path.
+  app.use('/payments/webhooks', express.raw({ type: '*/*', limit: '256kb' }));
+
   // SuperTokens must sit before express.json() and before your own routes —
   // it handles /auth/* itself.
   app.use(supertokensMiddleware());

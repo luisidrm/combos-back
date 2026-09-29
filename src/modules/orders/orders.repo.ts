@@ -1,11 +1,17 @@
-import { and, asc, desc, eq, inArray, isNull, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
 import type { Transaction } from '../../db/client.js';
 import {
   addresses,
+  orderItems,
+  orders,
   recipients,
   type Address,
   type NewAddress,
+  type NewOrder,
+  type NewOrderItem,
   type NewRecipient,
+  type Order,
+  type OrderItem,
   type Recipient,
 } from './orders.schema.js';
 
@@ -151,4 +157,91 @@ export async function findOldestAddress(tx: Transaction, recipientId: string): P
     .orderBy(asc(addresses.createdAt))
     .limit(1);
   return row;
+}
+
+// --- orders -----------------------------------------------------------------
+
+export async function insertOrder(tx: Transaction, values: NewOrder): Promise<Order> {
+  const [row] = await tx.insert(orders).values(values).returning();
+  if (!row) {
+    throw new Error('Insert into orders returned no row');
+  }
+  return row;
+}
+
+export async function insertOrderItems(tx: Transaction, values: NewOrderItem[]): Promise<OrderItem[]> {
+  if (values.length === 0) {
+    return [];
+  }
+  return tx.insert(orderItems).values(values).returning();
+}
+
+export async function findById(tx: Transaction, id: string): Promise<Order | undefined> {
+  const [row] = await tx.select().from(orders).where(eq(orders.id, id)).limit(1);
+  return row;
+}
+
+export async function findForBuyer(tx: Transaction, buyerUserId: string, id: string): Promise<Order | undefined> {
+  const [row] = await tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.id, id), eq(orders.buyerUserId, buyerUserId)))
+    .limit(1);
+  return row;
+}
+
+export async function listForBuyer(tx: Transaction, buyerUserId: string): Promise<Order[]> {
+  return tx.select().from(orders).where(eq(orders.buyerUserId, buyerUserId)).orderBy(desc(orders.createdAt));
+}
+
+export async function listForAdmin(tx: Transaction, filter: { status?: string } = {}): Promise<Order[]> {
+  return tx
+    .select()
+    .from(orders)
+    .where(filter.status ? eq(orders.status, filter.status) : undefined)
+    .orderBy(desc(orders.createdAt));
+}
+
+export async function listItems(tx: Transaction, orderId: string): Promise<OrderItem[]> {
+  return tx.select().from(orderItems).where(eq(orderItems.orderId, orderId)).orderBy(asc(orderItems.createdAt));
+}
+
+export async function listItemsForOrders(tx: Transaction, orderIds: string[]): Promise<OrderItem[]> {
+  if (orderIds.length === 0) {
+    return [];
+  }
+  return tx.select().from(orderItems).where(inArray(orderItems.orderId, orderIds));
+}
+
+export async function orderNumberExists(tx: Transaction, orderNumber: string): Promise<boolean> {
+  const [row] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.orderNumber, orderNumber)).limit(1);
+  return row !== undefined;
+}
+
+interface StatusUpdate {
+  status: string;
+  placedAt?: Date;
+  paidAt?: Date;
+  deliveredAt?: Date;
+  cancelledAt?: Date;
+}
+
+export async function updateStatus(tx: Transaction, id: string, values: StatusUpdate): Promise<Order | undefined> {
+  const [row] = await tx
+    .update(orders)
+    .set({ ...values, updatedAt: new Date() })
+    .where(eq(orders.id, id))
+    .returning();
+  return row;
+}
+
+// Reconciliation: orders whose payment was never confirmed, old enough to
+// act on. Age is measured from placed_at, not created_at — they're the same
+// value at checkout today, but placed_at is the one that means "the clock a
+// buyer would expect started when they placed the order".
+export async function findStalePendingPayment(tx: Transaction, olderThan: Date): Promise<Order[]> {
+  return tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.status, 'pending_payment'), lt(orders.placedAt, olderThan)));
 }
