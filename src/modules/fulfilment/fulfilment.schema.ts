@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import { boolean, pgTable, text, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { tenantIsolationPolicy } from '../../db/rls.js';
 
@@ -46,3 +47,15 @@ export const deliveries = pgTable(
 
 export type Delivery = typeof deliveries.$inferSelect;
 export type NewDelivery = typeof deliveries.$inferInsert;
+
+// --- request DTOs ---------------------------------------------------------
+
+export const orderParamSchema = z.object({ orderId: z.string().uuid() });
+
+// Proof of delivery: who actually received it, plus an optional note. The photo is uploaded
+// separately through /media (owner type "delivery", owner id = the order id) before this call.
+export const confirmDeliverySchema = z.object({
+  recipientName: z.string().trim().min(1).max(255),
+  notes: z.string().trim().max(1000).optional(),
+});
+export type ConfirmDeliveryInput = z.infer<typeof confirmDeliverySchema>;

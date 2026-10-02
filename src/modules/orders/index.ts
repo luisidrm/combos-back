@@ -2,6 +2,13 @@ export { ordersRouter as router, recipientsRouter } from './orders.routes.js';
 export { ordersService, orderStatuses } from './orders.service.js';
 export type {
   AddressView,
+  AdminOrderDetail,
+  AdminOrderListItem,
+  PaymentInstructions,
+  BuyerSummary,
+  PeriodTotals,
+  SalesStats,
+  StatsRange,
   OrderDetailView,
   OrderItemView,
   OrderView,

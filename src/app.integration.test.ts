@@ -127,6 +127,10 @@ describe('the app over HTTP, with a database', () => {
         taglineEn: 'Deliveries in Cuba',
         descriptionEs: null,
         descriptionEn: null,
+        freeDeliveryOverCents: null,
+        sameDayCutoff: null,
+        contact: { phone: null, email: null, address: null },
+        openingHours: null,
         logo: null,
       });
     });

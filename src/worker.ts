@@ -7,12 +7,14 @@ import { logger } from './core/logger.js';
 import { cartService } from './modules/cart/index.js';
 import { registerCatalogWorker } from './modules/catalog/index.js';
 import { mediaService, registerMediaWorker } from './modules/media/index.js';
+import { registerNotificationsWorker } from './modules/notifications/index.js';
 import { registerOrdersWorker, runOrderReconciliation } from './modules/orders/index.js';
 import { tenancyService } from './modules/tenancy/index.js';
 
 registerMediaWorker();
 registerCatalogWorker();
 registerOrdersWorker();
+registerNotificationsWorker();
 
 // Housekeeping with no request behind it: discard abandoned uploads and
 // stale guest carts. A job has no tenant of its own, so it walks the active

@@ -36,6 +36,7 @@ async function findOrCreateFromSession(
   supertokensUserId: string,
   email: string,
   role: Role = 'buyer',
+  profile: { fullName?: string; phone?: string } = {},
 ): Promise<User> {
   return withTenant(tenantId, async (tx) => {
     const existing = await identityRepo.findBySupertokensUserId(tx, supertokensUserId);
@@ -45,8 +46,18 @@ async function findOrCreateFromSession(
       }
       return existing;
     }
-    return identityRepo.insert(tx, { tenantId, supertokensUserId, email, role });
+    return identityRepo.insert(tx, { tenantId, supertokensUserId, email, role, fullName: profile.fullName, phone: profile.phone });
   });
+}
+
+// Name + email of some users, for screens that list other people's orders (the admin queue).
+// Missing ids are simply absent from the result.
+async function getSummaries(
+  tenantId: string,
+  userIds: string[],
+): Promise<Map<string, { fullName: string | null; email: string }>> {
+  const rows = await withTenant(tenantId, (tx) => identityRepo.findByIds(tx, [...new Set(userIds)]));
+  return new Map(rows.map((row) => [row.id, { fullName: row.fullName, email: row.email }]));
 }
 
 async function setRole(tenantId: string, userId: string, role: Role): Promise<User> {
@@ -65,5 +76,6 @@ export const identityService = {
   getBySupertokensUserId,
   findBySupertokensUserId,
   findOrCreateFromSession,
+  getSummaries,
   setRole,
 };

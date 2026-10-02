@@ -4,6 +4,7 @@ import { events } from '../../core/events.js';
 import { logger } from '../../core/logger.js';
 import { ConflictError, NotFoundError } from '../../core/errors.js';
 import { withTenant, type Transaction } from '../../db/client.js';
+import { listManualMethods, type ManualMethodName } from './manual-methods.js';
 import * as paymentsRepo from './payments.repo.js';
 import { ManualTransferProvider } from './providers/manual-transfer.provider.js';
 import { TropiPayProvider } from './providers/tropipay.provider.js';
@@ -173,8 +174,48 @@ async function processWebhook(providerName: string, req: Request): Promise<Webho
   return outcome;
 }
 
+// --- manual transfer reports ----------------------------------------------------
+
+export interface TransferReport {
+  method: ManualMethodName;
+  /** The confirmation / transaction number the buyer's app showed. */
+  transferReference: string;
+  notes: string | null;
+  reportedAt: Date;
+}
+
+const TRANSFER_REPORTED = 'transfer_reported';
+
+async function recordTransferReport(
+  tx: Transaction,
+  input: { tenantId: string; paymentId: string; method: ManualMethodName; transferReference: string; notes?: string | null },
+): Promise<void> {
+  await paymentsRepo.insertEventIfNew(tx, {
+    tenantId: input.tenantId,
+    paymentId: input.paymentId,
+    providerEventId: `manual-report:${crypto.randomUUID()}`,
+    eventType: TRANSFER_REPORTED,
+    payload: { method: input.method, transferReference: input.transferReference, notes: input.notes ?? null },
+    processedAt: new Date(),
+  });
+}
+
+// The latest report per order, for the admin queue and an order's detail.
+async function getLatestTransferReports(tx: Transaction, orderIds: string[]): Promise<Map<string, TransferReport>> {
+  const rows = await paymentsRepo.findLatestReports(tx, TRANSFER_REPORTED, orderIds);
+  return new Map(
+    rows.map((row) => {
+      const payload = row.payload as { method: ManualMethodName; transferReference: string; notes: string | null };
+      return [row.orderId, { method: payload.method, transferReference: payload.transferReference, notes: payload.notes, reportedAt: row.createdAt }];
+    }),
+  );
+}
+
 // The only public surface other modules may depend on (via index.ts).
 export const paymentsService = {
+  listManualMethods,
+  recordTransferReport,
+  getLatestTransferReports,
   getProvider,
   createPendingPayment,
   attachExternalId,

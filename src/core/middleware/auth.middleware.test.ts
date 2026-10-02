@@ -25,6 +25,8 @@ function user(overrides: Partial<User> & Pick<User, 'supertokensUserId'>): User 
     tenantId: TENANT_A,
     email: 'someone@example.com',
     role: 'buyer',
+    fullName: null,
+    phone: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     deletedAt: null,

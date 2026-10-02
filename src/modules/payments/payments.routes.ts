@@ -1,10 +1,17 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { NotFoundError } from '../../core/errors.js';
+import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
 import { providerNameSchema } from './payments.schema.js';
 import { paymentsService } from './payments.service.js';
 
 export const paymentsRouter = Router();
+
+// Which ways of paying this store offers, for the checkout to draw its choices. Public. The account
+// details themselves are not here: they are shown only to the buyer of an order (orders module).
+paymentsRouter.get('/methods', resolveTenant, (_req, res) => {
+  res.json({ card: true, manual: paymentsService.listManualMethods(0).map((m) => ({ method: m.method, label: m.label })) });
+});
 
 const providerParamSchema = z.object({ provider: providerNameSchema });
 

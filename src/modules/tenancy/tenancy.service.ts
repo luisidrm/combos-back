@@ -3,7 +3,7 @@ import { db } from '../../db/client.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { mediaService, type PublicPicture } from '../media/index.js';
 import * as tenancyRepo from './tenancy.repo.js';
-import type { CreateTenantInput, Tenant, TenantSettings, UpdateTenantInput } from './tenancy.schema.js';
+import type { CreateTenantInput, OpeningHours, StoreContact, Tenant, TenantSettings, UpdateTenantInput } from './tenancy.schema.js';
 
 // What a visitor needs to tell one shop from another (CLAUDE.md section 5):
 // no id, no settings, no timestamps.
@@ -15,6 +15,12 @@ export interface PublicStore {
   descriptionEs: string | null;
   descriptionEn: string | null;
   logo: PublicPicture | null;
+  // The "free delivery from $X" offer the storefront advertises (null = none).
+  // Public on purpose: it is a promise made to every visitor.
+  freeDeliveryOverCents: number | null;
+  sameDayCutoff: string | null;
+  contact: StoreContact;
+  openingHours: OpeningHours | null;
 }
 
 async function resolveBySlug(slug: string): Promise<Tenant> {
@@ -62,6 +68,7 @@ async function toPublicStore(tenant: Tenant): Promise<PublicStore> {
     descriptionEs: tenant.descriptionEs,
     descriptionEn: tenant.descriptionEn,
     logo: logos.get(tenant.id)?.[0] ?? null,
+    ...pickPublicSettings(readSettings(tenant)),
   };
 }
 
@@ -69,9 +76,25 @@ async function getPublicStore(tenantId: string): Promise<PublicStore> {
   return toPublicStore(await getById(tenantId));
 }
 
+function pickPublicSettings(settings: TenantSettings) {
+  return {
+    freeDeliveryOverCents: settings.freeDeliveryOverCents,
+    sameDayCutoff: settings.sameDayCutoff,
+    contact: settings.contact,
+    openingHours: settings.openingHours,
+  };
+}
+
 function readSettings(tenant: Tenant): TenantSettings {
-  const raw = (tenant.settings ?? {}) as { require_delivery_photo?: unknown };
-  return { requireDeliveryPhoto: raw.require_delivery_photo === true };
+  const raw = (tenant.settings ?? {}) as Record<string, unknown>;
+  const text = (value: unknown) => (typeof value === 'string' && value !== '' ? value : null);
+  return {
+    requireDeliveryPhoto: raw.require_delivery_photo === true,
+    freeDeliveryOverCents: typeof raw.free_delivery_over_cents === 'number' ? raw.free_delivery_over_cents : null,
+    sameDayCutoff: text(raw.same_day_cutoff),
+    contact: { phone: text(raw.contact_phone), email: text(raw.contact_email), address: text(raw.contact_address) },
+    openingHours: Array.isArray(raw.opening_hours) ? (raw.opening_hours as OpeningHours) : null,
+  };
 }
 
 async function getSettings(tenantId: string): Promise<TenantSettings> {
@@ -86,10 +109,26 @@ async function updateStore(
 ): Promise<PublicStore & { settings: TenantSettings }> {
   const existing = await getById(tenantId);
 
-  const mergedSettings =
-    input.settings?.requireDeliveryPhoto === undefined
-      ? undefined
-      : { ...(existing.settings as Record<string, unknown>), require_delivery_photo: input.settings.requireDeliveryPhoto };
+  const changes: Record<string, unknown> = {};
+  if (input.settings?.requireDeliveryPhoto !== undefined) {
+    changes.require_delivery_photo = input.settings.requireDeliveryPhoto;
+  }
+  if (input.settings?.freeDeliveryOverCents !== undefined) {
+    changes.free_delivery_over_cents = input.settings.freeDeliveryOverCents;
+  }
+  if (input.settings?.sameDayCutoff !== undefined) {
+    changes.same_day_cutoff = input.settings.sameDayCutoff;
+  }
+  if (input.settings?.openingHours !== undefined) {
+    changes.opening_hours = input.settings.openingHours;
+  }
+  for (const key of ['phone', 'email', 'address'] as const) {
+    const value = input.settings?.contact?.[key];
+    if (value !== undefined) {
+      changes[`contact_${key}`] = value === '' ? null : value;
+    }
+  }
+  const mergedSettings = Object.keys(changes).length === 0 ? undefined : { ...(existing.settings as Record<string, unknown>), ...changes };
 
   // Fields are picked one by one, never spread: this table holds the slug
   // (a store's identity) and the active flag (whether it is served at all),

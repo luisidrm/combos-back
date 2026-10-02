@@ -1,8 +1,9 @@
 # Combo Shop API — endpoint reference
 
-What every endpoint is for and what happens inside it. Reflects the code as of the M3 backend:
-checkout, the order state machine, both payment providers, webhooks, reconciliation. Fulfilment
-(couriers, delivery marking) and notifications have no endpoints yet — that's M4. `audit_log` is
+What every endpoint is for and what happens inside it. Reflects the code as of the M3 backend plus the
+first half of M4: checkout, the order state machine, both payment providers, webhooks, reconciliation,
+proof of delivery and the courier queue (section 9b), and order emails. A courier-assignment model and the
+offline queue are still to come. `audit_log` is
 written to internally by every state transition but has no read endpoint of its own yet.
 
 ## Conventions
@@ -24,6 +25,7 @@ and every `/auth/*` route except `POST /auth/signinup/code/consume` and `POST /a
 | Guest or buyer | A session for *this* store is used if present; otherwise the caller is treated as a guest (cart only). |
 | Buyer | Any logged-in user of this store. Works on their own data only. |
 | Admin | Logged in with role `admin` **for this store**. |
+| Staff or admin | Role `admin` **or** `staff` (the packer). Staff is the limited role: it works the order queue and flips product availability, and nothing that touches money, prices, deletions, analytics or settings. |
 
 **Sessions.** Cookies (`sAccessToken`, `sRefreshToken`, `sIdRefreshToken`), httpOnly, set by
 login. Send `credentials: 'include'`. The access token carries `tenantId` and `role`, but on every
@@ -59,7 +61,7 @@ SuperTokens' own 401s use `{ "message": "unauthorised" }`. Every response has an
 header (a well-formed one you send is kept); the same id is in the server logs.
 
 **Rate limits** (per client IP unless noted): 300 requests/min overall; cart writes 60/min; asking
-for a login code 10 per 15 min **and** 5 per address per hour; login attempts 30 per 15 min;
+signing up 10 per 15 min; login attempts 30 per 15 min; asking for another verification email 10 per 15 min **and** 5 per hour per account;
 requesting a password reset link 5 per 15 min **and** 3 per address per hour; submitting one
 20 per 15 min.
 
@@ -70,45 +72,49 @@ requesting a password reset link 5 per 15 min **and** 3 per address per hour; su
 
 ## 1. Login — `/auth` (SuperTokens)
 
-Two audiences, two methods. Add the header `rid: passwordless` or `rid: emailpassword` as the
-SuperTokens client does.
+Everyone — buyers and staff — signs in with **email + password**. Add the header `rid: emailpassword`
+(`rid: emailverification` for the verification calls) as the SuperTokens client does. Passwords:
+at least 10 characters, one letter and one digit (a weak one is `400` with
+`{status:"FIELD_ERROR", formFields:[{id:"password",error}]}`).
 
-### POST `/auth/signinup/code` — buyer: ask for a login code
-Body `{ "email" }`. Creates a one-time code (6 digits, valid ~15 min, max 5 wrong attempts) and
-sends it. In production it is emailed through Resend (bilingual text); outside production it is
-written to the API log (`Login code (dev only, not emailed)`) and nothing is sent. Returns
-`{ status:"OK", deviceId, preAuthSessionId, flowType }` — keep both ids for the next step. No
-user is created yet, and no tenant is involved at this stage.
-
-### POST `/auth/signinup/code/resend` — buyer: send a fresh code
-Body `{ deviceId, preAuthSessionId }`. Same delivery as above for the same login attempt.
-
-### POST `/auth/signinup/code/consume` — buyer: submit the code (**needs `x-tenant-slug`**)
-Body `{ userInputCode, deviceId, preAuthSessionId }`.
+### POST `/auth/signup` — buyer: create an account (**needs `x-tenant-slug`**)
+Body `{ formFields:[{id:"email",value},{id:"password",value},{id:"name",value},{id:"phone",value}] }`.
+`name` is required (≤255 chars); `phone` is optional (same loose format as a recipient phone).
 1. The tenant is resolved from the header (missing → 401, unknown/inactive → 404).
-2. SuperTokens checks the code. A wrong/expired code returns HTTP 200 with
-   `status: "INCORRECT_USER_INPUT_CODE_ERROR"` / `"EXPIRED_USER_INPUT_CODE_ERROR"` / `"RESTART_FLOW_ERROR"`.
-3. On success we find or create this person's `users` row **in this store** (role `buyer`). A
-   disabled (soft-deleted) account gets 403.
-4. A session is created carrying `tenantId` and `role`; cookies are set.
-Returns `{ status:"OK", createdNewUser, user:{ id, email, timeJoined } }`. One email can be a
-buyer at several stores — each store gets its own `users` row.
+2. A login is created and a `users` row with role `buyer` **in this store**, holding `name`/`phone`.
+3. A **verification email** is sent right away (logged instead, outside production — the log line
+   `Email verification link (dev only, not emailed)` carries the link). A mail failure does not undo the signup.
+4. A session is created (cookies set) — the new buyer is signed in.
+Returns `{ status:"OK", user }`, or HTTP 200 `{ status:"FIELD_ERROR", formFields:[{id,error}] }` (e.g.
+`email` "already exists"). Logins are global: an address that already has an account at another store
+is "already exists" here too — that person signs in instead (next endpoint).
 
-### POST `/auth/signin` — staff: email + password (**needs `x-tenant-slug`**)
-Body `{ formFields:[{id:"email",value},{id:"password",value}] }`. Checks the password, then
-requires a **staff** account (admin or courier, not buyer) for *this* store, otherwise returns
-`WRONG_CREDENTIALS_ERROR` — a valid password with no staff row here looks like a wrong
-password. On success, same session as above with the staff role. Staff accounts are created only
-by `npm run db:seed:admin`; there is no public signup, and no 2FA yet (M5).
+### POST `/auth/signin` — email + password (**needs `x-tenant-slug`**)
+Body `{ formFields:[{id:"email",value},{id:"password",value}] }`. Checks the password. If the person
+has no `users` row in *this* store yet (they signed up at another one) they become a **buyer** here.
+A disabled (soft-deleted) account, like a wrong password, returns `{status:"WRONG_CREDENTIALS_ERROR"}`.
+On success a session is created carrying `tenantId` and `role` (buyer, admin or courier); cookies are set.
+Staff accounts (admin, courier) are created only by `npm run db:seed:admin` — there is no public staff
+signup, and no 2FA yet (M5).
 
-### POST `/auth/user/password/reset/token` — staff: request a reset link
+### Email verification — buyers confirm their address once
+Verification is **not** needed to sign in, browse or fill a cart; it **is** needed to place an order
+(`POST /orders/checkout` answers `403`, `details.reason: "EMAIL_NOT_VERIFIED"`). `GET /identity/me`
+reports `emailVerified`.
+- **POST `/auth/user/email/verify`** — body `{ method:"token", token, tenantId:"public" }` (the token is in
+  the emailed link, which opens `<web>/account/verify-email?token=…&tenantId=public`). No session needed.
+  `{status:"OK"}`, or HTTP 200 `{status:"EMAIL_VERIFICATION_INVALID_TOKEN_ERROR"}` for an expired/used token.
+- **POST `/auth/user/email/verify/token`** — *needs the session.* Sends another link.
+  `{status:"OK"}` or `{status:"EMAIL_ALREADY_VERIFIED_ERROR"}`. Rate-limited per account (5/hour).
+
+### POST `/auth/user/password/reset/token` — request a reset link
 *No tenant header* — a password login is global, and this only needs the address. Body
 `{ formFields:[{id:"email",value}] }`. **Always answers `{status:"OK"}`**, whether or not that
 address has an account — it cannot be used to discover who has one. If it does, an emailed link
 (logged instead, outside production) carries a single-use token valid about an hour. Rate-limited
 per address (5/hour) and per IP (5/15 min), since every call sends a real email.
 
-### POST `/auth/user/password/reset` — staff: submit the new password
+### POST `/auth/user/password/reset` — submit the new password
 Body `{ formFields:[{id:"password",value}], token }`. The password policy — at least 10
 characters, one letter and one digit — is enforced here too (a weak one is `400` with
 `{status:"FIELD_ERROR", formFields:[{id:"password",error}]}`, and the token is **not** consumed).
@@ -135,24 +141,26 @@ new tenant (201); a slug already taken is **409**.
 
 ### GET `/tenancy/current` — the store's public page
 *Public.* What the storefront header needs to tell one shop from another:
-`{ slug, name, taglineEs, taglineEn, descriptionEs, descriptionEn, logo }` where `logo` is a
-`PublicPicture` (see Media) or `null`. Nothing internal (no id, settings or timestamps).
+`{ slug, name, taglineEs, taglineEn, descriptionEs, descriptionEn, logo, freeDeliveryOverCents, sameDayCutoff, contact, openingHours }` where
+`logo` is a `PublicPicture` (see Media) or `null`, and `freeDeliveryOverCents` is the store's "free delivery
+from $X" offer in cents (`null` = none). Nothing else internal (no id, other settings or timestamps).
 
 ### PATCH `/tenancy/current` — edit branding and switches (Admin)
 Body, all optional: `{ name, taglineEs, taglineEn, descriptionEs, descriptionEn, settings:{
-requireDeliveryPhoto } }`; `null` clears a nullable text field. Only the fields sent change, and
+requireDeliveryPhoto, freeDeliveryOverCents, sameDayCutoff, contact:{ phone, email, address }, openingHours } }`; `sameDayCutoff` is `"HH:MM"` Cuba time (shown to buyers, not enforced); `openingHours` is exactly 7 entries, Monday first, each `{ open, close }` (`"HH:MM"`) or `null` for closed; `settings.freeDeliveryOverCents` is a whole number of cents (`null` switches the offer off). Orders whose subtotal reaches it ship free: `POST /orders/quote` and checkout waive the zone fee.
+ `null` clears a nullable text field. Only the fields sent change, and
 the fields are picked one by one — the slug and the active flag can never be edited here. Returns
 the public page plus `settings`. The logo is set through Media (`ownerType:"tenant"`).
 
 ### GET `/tenancy/admin/settings` — read the switches (Admin)
-`{ requireDeliveryPhoto: boolean }` (default `false`): whether a delivery needs a proof photo
+`{ requireDeliveryPhoto: boolean, freeDeliveryOverCents: number | null }` (defaults `false` / `null`): whether a delivery needs a proof photo
 before it can be marked delivered (used by fulfilment in M4).
 
 ## 3. Identity — `/identity`
 
 ### GET `/identity/me` — who am I
-*Auth: any logged-in user.* Returns `{ id, email, role }`: `id` is our internal user id (used by
-every other module). Read fresh from the database on this request, so it reflects the account's
+*Auth: any logged-in user.* Returns `{ id, email, role, fullName, phone, emailVerified }`: `id` is our internal user id (used by
+every other module); `fullName`/`phone` are what the buyer gave at signup (null for staff and older accounts). Read fresh from the database on this request, so it reflects the account's
 current role and disabled state, not the token's.
 
 ---
@@ -178,9 +186,9 @@ pictures, cover first). Drafts, deactivated, deleted or other-store products ret
 
 ### Admin — categories
 
-**GET `/catalog/admin/categories`** — every non-deleted category, including inactive ones.
+**GET `/catalog/admin/categories`** *(Staff or admin)* — every non-deleted category, including inactive ones. Each has `icon`: a glyph name the storefront draws on the category chip, one of `cup-soda, beef, milk, apple, candy, fish, wheat, egg, sandwich, shopping-basket, leaf, utensils`, or `null`. The public `GET /catalog/categories` returns it too.
 
-**POST `/catalog/categories`** — body `{ nameEs, nameEn?, active? }`. Appends to the end of the
+**POST `/catalog/categories`** — body `{ nameEs, nameEn?, icon?, active? }`. Appends to the end of the
 order. `nameEn` defaults to `nameEs`.
 
 **PATCH `/catalog/categories/:id`** — partial update of the same fields. `active:false` hides
@@ -195,7 +203,7 @@ must exist (else 400 and nothing is applied). Send the **full** list — see the
 
 ### Admin — products
 
-**GET `/catalog/admin/products?categoryId=&active=`** — all non-deleted products, drafts
+**GET `/catalog/admin/products?categoryId=&active=`** *(Staff or admin; `/admin/products/:id`, `PATCH /catalog/products/:id` and `…/activate|deactivate` too — but a `staff` PATCH may carry only `stockStatus`, anything else is `403 STAFF_FIELDS`)* — all non-deleted products, drafts
 included; `active=true|false` filters.
 
 **GET `/catalog/admin/products/:id`** — one product (any state).
@@ -239,7 +247,7 @@ derivative **URLs**, never storage keys or the original.
 
 **Permissions by owner type** (used by every endpoint below except the public list): `product` →
 admin; `tenant` (the store logo; `ownerId` must be the store's own id) → admin; `delivery` →
-admin or courier; `user` → only that user. The role is re-read from the database on each request.
+admin, staff or courier (the owner id is the **order** id); `payment_proof` (a buyer's screenshot of a manual transfer; owner id = the order id) → admin or staff, or the buyer of that order (404 for any other buyer), never a courier; `user` → only that user. The role is re-read from the database on each request.
 
 **Shapes.** `PublicPicture = { id, thumbUrl, cardUrl, fullUrl, width, height, altTextEs,
 altTextEn, isCover }` (ready pictures only). `MediaView = { id, ownerType, ownerId, status
@@ -446,7 +454,8 @@ productNameEs, unitLabel, unitPriceCents, quantity, lineTotalCents }] }` — eve
 **frozen snapshot** taken at checkout; editing the product or the address book afterwards never
 changes a past order (CLAUDE.md §5).
 
-### POST `/orders/checkout` — place the order (Buyer)
+### POST `/orders/checkout` — place the order (Buyer, **email confirmed**)
+An unconfirmed buyer gets `403` with `details.reason: "EMAIL_NOT_VERIFIED"`.
 Body `{ recipientId, addressId, provider: "tropipay"|"manual", giftMessage?, buyerNotes? }`. Re-runs
 the same pricing as `/quote`; `409` with the same `blockers` shape if it still can't go ahead.
 On success (201): creates the order in **`pending_payment`**, snapshots every cart line into
@@ -455,8 +464,8 @@ the chosen provider to start a checkout session. Returns
 `{ order: OrderDetail, checkoutUrl: string | null }`. `checkoutUrl` is `null` for `manual` (there is
 nothing to redirect to — show the buyer payment instructions instead) and also `null` if the
 provider call itself failed (network blip, provider outage) — the order still exists either way;
-retry with the endpoint below. The order number looks like `ORD-8FQXH2KM` (no `0/O/1/I/L`, so it
-reads back over the phone without ambiguity).
+retry with the endpoint below. The order number is `FC-1001`, `FC-1002`, … — generated by the server,
+sequential **per store** (each store counts from 1001), unique, never reused. Show it as `#FC-1001`.
 
 ### GET `/orders` — the buyer's own orders (Buyer)
 `Order[]`, newest first.
@@ -472,14 +481,30 @@ Body `{ note? }` (or no body at all). **Only while `pending_payment`** — once 
 undoing it is a refund (admin-only), not a cancel; `409 ILLEGAL_TRANSITION` otherwise.
 
 ### Admin
-`GET /orders/admin/list?status=` · `GET /orders/admin/:id` — same shapes as above, any buyer's
-order in the store.
+`GET /orders/admin/list?status=` · `GET /orders/admin/:id` *(Staff or admin)* — the order shapes above, any buyer's
+order in the store, plus `buyer: { fullName, email } | null` on both and `itemCount` (units in the box) on the list.
 
 `POST /orders/admin/:id/mark-paid` — body `{ note? }`. A manual override ("I can see in my
 TropiPay dashboard/bank that this was paid") for **any** provider, not only `manual` — covers a
 missed webhook. Flips the payment row alongside the order, in one transaction.
 
-`POST /orders/admin/:id/preparing` — `paid` → `preparing`.
+`POST /orders/admin/:id/preparing` *(Staff or admin)* — `paid` → `preparing`.
+
+`POST /orders/admin/:id/out-for-delivery` *(Staff or admin)* — `preparing` → `out_for_delivery`.
+
+`POST /orders/admin/:id/delivered` *(Staff or admin)* — `out_for_delivery` → `delivered`. If the store requires a
+delivery photo (`settings.requireDeliveryPhoto`) this answers `409 DELIVERY_PHOTO_REQUIRED`; use
+`POST /fulfilment/orders/:orderId/deliver` (section 9b), which records the proof. Without the setting this plain
+endpoint still works but records no proof.
+
+`GET /orders/admin/stats?range=week|month|year` *(Admin only)* — sales figures. A sale counts from the moment an
+order is paid until it is refunded or cancelled, dated by when it was **paid**, in Cuba time. `week` = the last 7
+days, `month` = 30, `year` = 12 calendar months (each including today / this month). Returns:
+`{ range, currency, granularity: "day"|"month", current, previous, series, byMunicipality, topProducts }` where
+`current`/`previous` (the equal-length period right before) are `{ orders, totalCents, averageTicketCents,
+freeDeliveryShare }` (share 0–1); `series` is one `{ bucket, totalCents, orders }` per day (or month), oldest first,
+empty buckets included; `byMunicipality` is `[{ provinceId, municipalityId, orders }]` busiest first; `topProducts`
+is the best five by units: `[{ productId, nameEs, nameEn, quantity, totalCents }]`.
 
 `POST /orders/admin/:id/cancel` — admin override of the buyer's own cancel rule (still only from
 `pending_payment`).
@@ -493,6 +518,71 @@ see CLAUDE.md §6's transition table).
 status is returned unchanged (200), not an error — a retried webhook or admin click is a no-op,
 not a failure. An actually-illegal move (e.g. `preparing` an order still `pending_payment`) is
 `409` with `details: { reason: "ILLEGAL_TRANSITION", from, to, allowed }`.
+
+---
+
+## 9b. Fulfilment — `/fulfilment` (proof of delivery, courier queue)
+
+Delivery photos are ordinary media: `POST /media/upload-url` with `ownerType: "delivery"` and `ownerId` = the
+**order id**, upload, confirm, as in section 5. Then record the hand-over:
+
+**POST `/fulfilment/orders/:orderId/deliver`** *(Admin, staff or courier)* — body `{ recipientName, notes? }`
+(`recipientName` required, up to 255 chars). The order must be `out_for_delivery` (else `409
+ILLEGAL_TRANSITION`). If the store requires a photo and the order has no **ready** photo yet: `409
+DELIVERY_PHOTO_REQUIRED`. On success it saves who received it, moves the order to `delivered` and returns the proof
+(below). Idempotent: repeating it for an already-delivered order returns the recorded proof unchanged, so a courier
+retrying after a dropped connection is safe.
+
+**GET `/fulfilment/orders/:orderId/proof`** *(any signed-in user; a buyer only for their own order, else 404)* —
+`{ orderId, recipientName, notes, deliveredAt, photos: [{ id, thumbUrl, cardUrl, fullUrl }] } | null` (null = none
+recorded). Only photos that finished processing are listed.
+
+**GET `/fulfilment/queue`** *(Admin, staff or courier)* — the orders that are `out_for_delivery`, in the admin
+list shape (recipient and address snapshots, buyer, item count). There is no per-courier assignment yet: every
+courier sees the whole queue.
+
+**Order emails.** When an order becomes `paid`, `out_for_delivery` or `delivered` the buyer gets a bilingual email
+(the delivered one links to the order page, where the proof is shown). It is sent by the worker process from the
+`order.status_changed` event, which the orders module emits only when the status really changed. Outside production
+nothing is emailed and the event is logged instead.
+
+---
+
+## 9c. Manual transfer — Zelle, Cash App, PayPal
+
+A buyer can pay an order by sending money from their own Zelle / Cash App / PayPal app. There is **no integration**
+with any of them (no SDK, no API, no webhook): we only show the instructions and a link that opens the app, and a
+person at the store checks the store's own account and marks the order paid. Accounts come from the environment
+(`ZELLE_EMAIL`, `CASHAPP_EMAIL` / `CASHAPP_CASHTAG`, `PAYPAL_EMAIL` / `PAYPAL_ME_HANDLE`, optional
+`MANUAL_PAYEE_NAME`); a method is offered only when its account is set. With a Cash App cashtag or a paypal.me handle
+the link opens the app **with the amount already filled in**; without one it only opens the app and the buyer types the
+amount. Zelle has no public link at all (it lives inside the buyer's bank app), so it is instructions only.
+
+**GET `/payments/methods`** — public. `{ card: true, manual: [{ method: "zelle"|"cashapp"|"paypal", label }] }`.
+The checkout offers the transfer choice only when `manual` is not empty. No account details here.
+
+**POST `/orders/checkout`** with `provider: "manual"` creates the order as `pending_payment` with no redirect
+(`checkoutUrl: null`).
+
+**GET `/orders/:id/payment-instructions`** *(the buyer of the order)* — `null` for a card order, otherwise
+`{ orderId, orderNumber, status, amountCents, currency, reference, methods: [{ method, label, recipient, payeeName,
+link, amountInLink }], report }`. `reference` is the order number, to be written in the transfer's note. `report` is
+the latest thing the buyer reported (below) or `null`.
+
+**POST `/orders/:id/transfer-report`** *(the buyer of the order)* — "I sent it". Body `{ method, transferReference
+(3–100 chars), notes? }`. A screenshot must already exist: upload it through the media flow with `ownerType:
+"payment_proof"` and `ownerId` = the order id (a failed upload does not count) or it answers `409
+SCREENSHOT_REQUIRED`. `409 NOT_PENDING_PAYMENT` once the order is no longer waiting for payment; `400` for a method the
+store does not accept. May be sent again to correct it: the latest report wins. Returns the instructions. It is
+**evidence for the admin, not a payment**: the order stays `pending_payment`. (Stored as a `transfer_reported`
+event on the payment, so there is no extra table.)
+
+**Admin side.** `GET /orders/admin/list` rows carry `transferReported` (an unpaid order with a report waiting to be
+checked); `GET /orders/admin/:id` carries `paymentProvider` and `paymentReport`
+(`{ method, transferReference, notes, reportedAt }`). The screenshots are read with `GET
+/media/manage?ownerType=payment_proof&ownerId=<orderId>`. After checking the store's account, an admin calls the
+existing `POST /orders/admin/:id/mark-paid` (admins only; staff never touch money). An unpaid order is still
+auto-cancelled after 72 h.
 
 ---
 
@@ -537,7 +627,7 @@ provider's webhook (or an admin's `mark-paid`) moves the order to `paid` → `GE
 show the buyer their receipt.
 
 **Admin, fulfilling an order.** `GET /orders/admin/list?status=paid` → `POST
-/orders/admin/:id/preparing` → *(M4: mark out for delivery / delivered, once fulfilment ships)*.
+/orders/admin/:id/preparing` → `…/out-for-delivery` → hand over: upload the photo (media, owner type `delivery`, owner id = the order) → `POST /fulfilment/orders/:orderId/deliver`.
 If a buyer asks for their money back: `POST /orders/admin/:id/refund`.
 
 **Admin, adding a product.** `POST /auth/signin` → `POST /catalog/categories` → `POST

@@ -59,18 +59,13 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
   const rateLimit = createRateLimiter(rateLimitStore);
   // A generous ceiling for everything, per client.
   app.use(rateLimit({ name: 'global', limit: 300, windowSeconds: 60 }));
-  // Login endpoints, before SuperTokens handles them. Asking for a code sends
-  // an email, so it is the tightest; a per-address limit inside the
-  // passwordless override (core/supertokens.ts) stops one inbox being flooded
-  // from many IPs.
-  app.post(
-    ['/auth/signinup/code', '/auth/signinup/code/resend'],
-    rateLimit({ name: 'otp-request-ip', limit: 10, windowSeconds: 15 * 60 }),
-  );
-  app.post(
-    ['/auth/signinup/code/consume', '/auth/signin'],
-    rateLimit({ name: 'login-ip', limit: 30, windowSeconds: 15 * 60 }),
-  );
+  // Login and signup, before SuperTokens handles them. Signup also sends a
+  // verification email, so it gets the tighter per-IP limit.
+  app.post('/auth/signup', rateLimit({ name: 'signup-ip', limit: 10, windowSeconds: 15 * 60 }));
+  app.post('/auth/signin', rateLimit({ name: 'login-ip', limit: 30, windowSeconds: 15 * 60 }));
+  // Asking for another verification link sends an email (a per-account limit
+  // inside the email verification override in core/supertokens.ts backs this up).
+  app.post('/auth/user/email/verify/token', rateLimit({ name: 'verify-email-ip', limit: 10, windowSeconds: 15 * 60 }));
   // Password reset: asking for a link sends an email (tight); submitting a
   // token is guessing-resistant already (long random single-use tokens) but is
   // still capped.

@@ -42,6 +42,7 @@ export interface PublicCategory {
   id: string;
   nameEs: string;
   nameEn: string;
+  icon: string | null;
 }
 
 // What cart and orders need to price and snapshot a line. `active` is
@@ -134,6 +135,7 @@ async function createCategory(tenantId: string, input: CreateCategoryInput): Pro
       tenantId,
       nameEs: input.nameEs,
       nameEn: input.nameEn ?? input.nameEs,
+      icon: input.icon,
       active: input.active,
       sortOrder: await catalogRepo.nextCategorySortOrder(tx),
     }),
@@ -319,7 +321,7 @@ async function deactivateIfNoReadyPicture(tenantId: string, productId: string): 
 
 async function listPublicCategories(tenantId: string): Promise<PublicCategory[]> {
   const rows = await withTenant(tenantId, (tx) => catalogRepo.listCategories(tx, { active: true }));
-  return rows.map(({ id, nameEs, nameEn }) => ({ id, nameEs, nameEn }));
+  return rows.map(({ id, nameEs, nameEn, icon }) => ({ id, nameEs, nameEn, icon }));
 }
 
 async function listPublicProducts(tenantId: string, filter: { categoryId?: string }): Promise<PublicProduct[]> {

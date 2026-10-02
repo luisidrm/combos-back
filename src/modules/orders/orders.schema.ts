@@ -39,6 +39,9 @@ export const addresses = pgTable(
     street: varchar('street', { length: 255 }).notNull(),
     betweenStreets: varchar('between_streets', { length: 255 }),
     buildingApartment: varchar('building_apartment', { length: 255 }),
+    // The reparto / barrio people actually name when giving directions. Free text for now;
+    // delivery zones stay per municipality.
+    neighborhood: varchar('neighborhood', { length: 100 }),
     referencePoints: text('reference_points'),
     lat: numeric('lat', { precision: 9, scale: 6 }),
     lng: numeric('lng', { precision: 9, scale: 6 }),
@@ -115,6 +118,16 @@ export const orders = pgTable(
   ],
 );
 
+// One row per store: the last order number handed out (see ordersRepo.nextOrderNumber).
+export const orderCounters = pgTable(
+  'order_counters',
+  {
+    tenantId: uuid('tenant_id').primaryKey(),
+    lastNumber: integer('last_number').notNull(),
+  },
+  (table) => [tenantIsolationPolicy(table.tenantId)],
+);
+
 export type Order = typeof orders.$inferSelect;
 export type NewOrder = typeof orders.$inferInsert;
 
@@ -130,6 +143,9 @@ export const orderItems = pgTable(
       .references(() => orders.id),
     productId: uuid('product_id'), // nullable, soft ref -> catalog.products
     productNameSnapshot: varchar('product_name_snapshot', { length: 255 }).notNull(),
+    // English name and thumbnail as they were at purchase (null on orders placed before these existed).
+    productNameEnSnapshot: varchar('product_name_en_snapshot', { length: 255 }),
+    productThumbUrlSnapshot: text('product_thumb_url_snapshot'),
     unitLabelSnapshot: varchar('unit_label_snapshot', { length: 50 }).notNull(),
     unitPriceCents: integer('unit_price_cents').notNull(),
     quantity: integer('quantity').notNull(),
@@ -160,6 +176,7 @@ const addressFields = z.object({
   street: z.string().trim().min(1).max(255),
   betweenStreets: optionalText(255),
   buildingApartment: optionalText(255),
+  neighborhood: optionalText(100),
   referencePoints: optionalText(1000),
   // The optional Leaflet/OSM pin (CLAUDE.md section 10) — both or neither.
   lat: z.number().min(-90).max(90).nullable().optional(),
@@ -227,7 +244,18 @@ export const checkoutSchema = z.object({
 });
 export type CheckoutInput = z.infer<typeof checkoutSchema>;
 
+// The manual transfer apps (kept as a literal here: a schema file must not import another module's
+// runtime code, see CLAUDE.md section 13).
+export const transferReportSchema = z.object({
+  method: z.enum(['zelle', 'cashapp', 'paypal']),
+  transferReference: z.string().trim().min(3).max(100),
+  notes: z.string().trim().max(500).nullable().optional(),
+});
+export type TransferReportInput = z.infer<typeof transferReportSchema>;
+
 export const orderIdParamSchema = z.object({ id: z.string().uuid() });
+
+export const statsQuerySchema = z.object({ range: z.enum(['week', 'month', 'year']).default('week') });
 
 export const adminOrdersQuerySchema = z.object({
   status: z.enum(orderStatuses).optional(),

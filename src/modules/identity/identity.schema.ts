@@ -1,7 +1,9 @@
 import { pgTable, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { tenantIsolationPolicy } from '../../db/rls.js';
 
-export const roles = ['buyer', 'admin', 'courier'] as const;
+// staff = the packer: sees and advances orders and flips stock/visibility, but cannot touch
+// money, prices, deletions, analytics or settings (see the route guards in orders/catalog).
+export const roles = ['buyer', 'admin', 'staff', 'courier'] as const;
 export type Role = (typeof roles)[number];
 
 export const users = pgTable(
@@ -12,6 +14,10 @@ export const users = pgTable(
     supertokensUserId: varchar('supertokens_user_id', { length: 36 }).notNull(),
     email: varchar('email', { length: 255 }).notNull(),
     role: varchar('role', { length: 20 }).notNull().default('buyer'),
+    // Collected at buyer signup (the design's form asks for both); null for
+    // staff and for accounts created before these columns existed.
+    fullName: varchar('full_name', { length: 255 }),
+    phone: varchar('phone', { length: 20 }),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
     deletedAt: timestamp('deleted_at', { withTimezone: true }),

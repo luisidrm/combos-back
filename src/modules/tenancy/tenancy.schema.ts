@@ -41,6 +41,8 @@ export const createTenantSchema = z.object({
 
 export type CreateTenantInput = z.infer<typeof createTenantSchema>;
 
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24 h)');
+
 // Per-store switches an admin can flip. Stored in the jsonb `settings`
 // column with snake_case keys (CLAUDE.md section 5). Kept to what exists;
 // each new setting is added here deliberately, never accepted as free-form.
@@ -55,11 +57,39 @@ export const updateTenantSchema = z.object({
       // Whether a delivery needs a proof photo before it can be marked
       // delivered (CLAUDE.md section 5, couriers).
       requireDeliveryPhoto: z.boolean().optional(),
+      // Orders whose subtotal reaches this amount ship free (the delivery
+      // fee of the zone is waived). null switches the offer off.
+      freeDeliveryOverCents: z.number().int().min(0).max(100_000_00).nullable().optional(),
+      // Orders placed before this time (Cuba time, "HH:MM") are delivered the same day; later ones
+      // the next day. Shown to buyers, not enforced.
+      sameDayCutoff: hhmm.nullable().optional(),
+      // How buyers can reach the shop.
+      contact: z
+        .object({
+          phone: z.string().trim().max(40).nullable().optional(),
+          email: z.string().trim().email().max(255).nullable().optional(),
+          address: z.string().trim().max(500).nullable().optional(),
+        })
+        .optional(),
+      // Seven entries, Monday first; null = closed that day. null for the whole field clears it.
+      openingHours: z.array(z.object({ open: hhmm, close: hhmm }).nullable()).length(7).nullable().optional(),
     })
     .optional(),
 });
 export type UpdateTenantInput = z.infer<typeof updateTenantSchema>;
 
+export type OpeningHours = Array<{ open: string; close: string } | null>;
+
+export interface StoreContact {
+  phone: string | null;
+  email: string | null;
+  address: string | null;
+}
+
 export interface TenantSettings {
   requireDeliveryPhoto: boolean;
+  freeDeliveryOverCents: number | null;
+  sameDayCutoff: string | null;
+  contact: StoreContact;
+  openingHours: OpeningHours | null;
 }

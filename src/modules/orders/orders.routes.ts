@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
 import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
+import { requireVerifiedEmail } from '../../core/middleware/verified-email.middleware.js';
 import { validate } from '../../core/middleware/validate.middleware.js';
 import { currentUser, requireParam } from '../../core/request.js';
 import {
@@ -12,6 +13,8 @@ import {
   orderIdParamSchema,
   quoteSchema,
   recipientParamSchema,
+  statsQuerySchema,
+  transferReportSchema,
   transitionNoteSchema,
   updateAddressSchema,
   updateRecipientSchema,
@@ -22,7 +25,12 @@ import type { OrderStatus } from './orders.schema.js';
 export const ordersRouter = Router();
 
 const signedInBuyer = [resolveTenant, requireAuth];
+// Money moves here: receipts and payment notices go to the buyer's email, so it
+// has to be one they confirmed.
+const verifiedBuyer = [resolveTenant, requireAuth, requireVerifiedEmail];
 const adminOnly = [resolveTenant, requireAuth, requireRole('admin')];
+// The packer (staff) works the queue — reads orders and moves them along — but never touches money.
+const staffOrAdmin = [resolveTenant, requireAuth, requireRole('admin', 'staff')];
 
 // Price a checkout for a chosen recipient address: cart + delivery fee, and
 // the reasons (if any) it can't go ahead. Signed-in buyers only, since the
@@ -40,7 +48,7 @@ ordersRouter.post('/quote', ...signedInBuyer, validate({ body: quoteSchema }), a
 // right away, returns where to send the buyer to pay. A null checkoutUrl
 // means the order exists (pending_payment) but starting the payment session
 // failed — POST /orders/:id/retry-payment tries again.
-ordersRouter.post('/checkout', ...signedInBuyer, validate({ body: checkoutSchema }), async (req, res, next) => {
+ordersRouter.post('/checkout', ...verifiedBuyer, validate({ body: checkoutSchema }), async (req, res, next) => {
   try {
     const user = await currentUser(req);
     res.status(201).json(await ordersService.checkout(req.tenantId, user.id, req.body));
@@ -57,6 +65,32 @@ ordersRouter.get('/', ...signedInBuyer, async (req, res, next) => {
     next(err);
   }
 });
+
+// How to pay a manual-transfer order (the accounts, the exact amount, the reference). null for card orders.
+ordersRouter.get('/:id/payment-instructions', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    res.json(await ordersService.getPaymentInstructions(req.tenantId, user.id, requireParam(req, 'id')));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// "I sent it": which app, the confirmation number, a note. A screenshot must already be uploaded
+// (media owner type "payment_proof", owner id = the order). An admin then checks and marks it paid.
+ordersRouter.post(
+  '/:id/transfer-report',
+  ...signedInBuyer,
+  validate({ params: orderIdParamSchema, body: transferReportSchema }),
+  async (req, res, next) => {
+    try {
+      const user = await currentUser(req);
+      res.status(201).json(await ordersService.reportTransfer(req.tenantId, user.id, requireParam(req, 'id'), req.body));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 ordersRouter.get('/:id', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
   try {
@@ -100,7 +134,7 @@ ordersRouter.post(
 
 // --- admin ------------------------------------------------------------------
 
-ordersRouter.get('/admin/list', ...adminOnly, validate({ query: adminOrdersQuerySchema }), async (req, res, next) => {
+ordersRouter.get('/admin/list', ...staffOrAdmin, validate({ query: adminOrdersQuerySchema }), async (req, res, next) => {
   try {
     res.json(await ordersService.listOrdersForAdmin(req.tenantId, req.query as { status?: OrderStatus }));
   } catch (err) {
@@ -108,7 +142,17 @@ ordersRouter.get('/admin/list', ...adminOnly, validate({ query: adminOrdersQuery
   }
 });
 
-ordersRouter.get('/admin/:id', ...adminOnly, validate({ params: orderIdParamSchema }), async (req, res, next) => {
+// Sales figures (admin only). Declared before /admin/:id so "stats" is not read as an order id.
+ordersRouter.get('/admin/stats', ...adminOnly, validate({ query: statsQuerySchema }), async (req, res, next) => {
+  try {
+    const { range } = req.query as unknown as { range: 'week' | 'month' | 'year' };
+    res.json(await ordersService.getSalesStats(req.tenantId, range));
+  } catch (err) {
+    next(err);
+  }
+});
+
+ordersRouter.get('/admin/:id', ...staffOrAdmin, validate({ params: orderIdParamSchema }), async (req, res, next) => {
   try {
     res.json(await ordersService.getOrderForAdmin(req.tenantId, requireParam(req, 'id')));
   } catch (err) {
@@ -135,12 +179,40 @@ ordersRouter.post(
 
 ordersRouter.post(
   '/admin/:id/preparing',
-  ...adminOnly,
+  ...staffOrAdmin,
   validate({ params: orderIdParamSchema, body: transitionNoteSchema }),
   async (req, res, next) => {
     try {
       const user = await currentUser(req);
       res.json(await ordersService.adminMarkPreparing(req.tenantId, user.id, requireParam(req, 'id'), req.body.note));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+ordersRouter.post(
+  '/admin/:id/out-for-delivery',
+  ...staffOrAdmin,
+  validate({ params: orderIdParamSchema, body: transitionNoteSchema }),
+  async (req, res, next) => {
+    try {
+      const user = await currentUser(req);
+      res.json(await ordersService.adminMarkOutForDelivery(req.tenantId, user.id, requireParam(req, 'id'), req.body.note));
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+ordersRouter.post(
+  '/admin/:id/delivered',
+  ...staffOrAdmin,
+  validate({ params: orderIdParamSchema, body: transitionNoteSchema }),
+  async (req, res, next) => {
+    try {
+      const user = await currentUser(req);
+      res.json(await ordersService.adminMarkDelivered(req.tenantId, user.id, requireParam(req, 'id'), req.body.note));
     } catch (err) {
       next(err);
     }

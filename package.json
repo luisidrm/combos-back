@@ -20,6 +20,7 @@
     "db:generate": "drizzle-kit generate",
     "db:seed:geo": "tsx src/db/seed/geo.seed.ts",
     "db:seed:admin": "tsx src/db/seed/admin.seed.ts",
+    "db:seed:demo": "tsx src/db/seed/demo.seed.ts",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"
   },

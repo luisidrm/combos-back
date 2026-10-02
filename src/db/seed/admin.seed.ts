@@ -1,5 +1,6 @@
 import supertokens from 'supertokens-node';
 import EmailPassword from 'supertokens-node/recipe/emailpassword';
+import EmailVerification from 'supertokens-node/recipe/emailverification';
 import Session from 'supertokens-node/recipe/session';
 import { z } from 'zod';
 import { NotFoundError } from '../../core/errors.js';
@@ -19,6 +20,8 @@ const seedEnv = z.object({
   SEED_TENANT_SLUG: z.string().min(1).default('demo'),
   SEED_TENANT_NAME: z.string().min(1).default('Demo Shop'),
   SEED_ADMIN_EMAIL: z.string().email(),
+  // admin (default) or staff (the packer). Re-running with another role changes an existing user's role.
+  SEED_ROLE: z.enum(['admin', 'staff', 'courier']).default('admin'),
   // The same policy the login endpoints enforce — signing up through the
   // recipe directly, as this script does, would otherwise skip it.
   SEED_ADMIN_PASSWORD: z.string().superRefine((value, ctx) => {
@@ -56,16 +59,25 @@ async function main(): Promise<void> {
       : 'A login for this email already exists — its password was left unchanged',
   );
 
-  const user = await identityService.findOrCreateFromSession(tenant.id, authUser.id, env.SEED_ADMIN_EMAIL, 'admin');
-  if (user.role !== 'admin') {
-    await identityService.setRole(tenant.id, user.id, 'admin');
+  // Staff are vouched for by whoever runs this script — no inbox round trip.
+  const recipeUserId = authUser.loginMethods.find((method) => method.recipeId === 'emailpassword')?.recipeUserId;
+  if (recipeUserId) {
+    const token = await EmailVerification.createEmailVerificationToken(SUPERTOKENS_TENANT, recipeUserId, env.SEED_ADMIN_EMAIL);
+    if (token.status === 'OK') {
+      await EmailVerification.verifyEmailUsingToken(SUPERTOKENS_TENANT, token.token);
+    }
+  }
+
+  const user = await identityService.findOrCreateFromSession(tenant.id, authUser.id, env.SEED_ADMIN_EMAIL, env.SEED_ROLE);
+  if (user.role !== env.SEED_ROLE) {
+    await identityService.setRole(tenant.id, user.id, env.SEED_ROLE);
     // The role rides in the access token, so existing sessions would keep
     // the old one until the next login.
     await Session.revokeAllSessionsForUser(authUser.id);
-    console.log('Promoted the user to admin');
+    console.log(`Changed the user's role to ${env.SEED_ROLE}`);
   }
 
-  console.log(`Admin ready for tenant "${tenant.slug}"`);
+  console.log(`${env.SEED_ROLE} ready for tenant "${tenant.slug}"`);
 }
 
 main()

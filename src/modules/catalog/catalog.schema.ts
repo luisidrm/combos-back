@@ -10,6 +10,8 @@ export const categories = pgTable(
     tenantId: uuid('tenant_id').notNull(),
     nameEs: varchar('name_es', { length: 255 }).notNull(),
     nameEn: varchar('name_en', { length: 255 }).notNull(),
+    // A glyph name from categoryIcons below (the storefront draws it on the category chip).
+    icon: varchar('icon', { length: 40 }),
     sortOrder: integer('sort_order').notNull().default(0),
     active: boolean('active').notNull().default(true),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -21,6 +23,23 @@ export const categories = pgTable(
 
 export type Category = typeof categories.$inferSelect;
 export type NewCategory = typeof categories.$inferInsert;
+
+// The glyphs a category may use. A fixed list, not free text: the web app maps each name to a
+// bundled icon, so anything else could never be drawn.
+export const categoryIcons = [
+  'cup-soda',
+  'beef',
+  'milk',
+  'apple',
+  'candy',
+  'fish',
+  'wheat',
+  'egg',
+  'sandwich',
+  'shopping-basket',
+  'leaf',
+  'utensils',
+] as const;
 
 export const stockStatuses = ['available', 'limited', 'out'] as const;
 export type StockStatus = (typeof stockStatuses)[number];
@@ -79,6 +98,7 @@ export const createCategorySchema = z.object({
   nameEs: nameSchema,
   // `es` is required and `en` falls back to it (CLAUDE.md section 5).
   nameEn: nameSchema.optional(),
+  icon: z.enum(categoryIcons).nullable().optional(),
   active: z.boolean().optional(),
 });
 export type CreateCategoryInput = z.infer<typeof createCategorySchema>;

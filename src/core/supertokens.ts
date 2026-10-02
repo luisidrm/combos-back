@@ -1,6 +1,6 @@
 import supertokens from 'supertokens-node';
 import EmailPassword from 'supertokens-node/recipe/emailpassword';
-import Passwordless from 'supertokens-node/recipe/passwordless';
+import EmailVerification from 'supertokens-node/recipe/emailverification';
 import Session from 'supertokens-node/recipe/session';
 import { config } from '../config/index.js';
 import { InternalError, UnauthorizedError, ValidationError } from './errors.js';
@@ -17,15 +17,14 @@ import { tenancyService } from '../modules/tenancy/index.js';
 const SUPERTOKENS_TENANT = 'public';
 
 const rateLimitStore = createRedisStore(redisConnection);
-// Codes asked for one address per hour (a real user needs one or two), and
-// re-sends of one login attempt.
-const OTP_PER_EMAIL: LimitRule = { name: 'otp-request-email', limit: 5, windowSeconds: 60 * 60 };
-const OTP_RESEND_PER_DEVICE: LimitRule = { name: 'otp-resend-device', limit: 5, windowSeconds: 60 * 60 };
+// Each verification email goes to a real inbox: limit re-sends per account.
+const VERIFY_EMAIL_PER_USER: LimitRule = { name: 'verify-email-user', limit: 5, windowSeconds: 60 * 60 };
 // Each reset request sends an email to a real inbox.
 const RESET_PER_EMAIL: LimitRule = { name: 'password-reset-email', limit: 3, windowSeconds: 60 * 60 };
 
-// Staff choose their own password, so the bar is above SuperTokens' default
-// (8 characters): at least 10, with a letter and a digit. Applies at reset too.
+// Everyone with a password (buyers and staff) meets the same bar, above
+// SuperTokens' default (8 characters): at least 10, with a letter and a digit.
+// Applies at signup and at reset.
 const MIN_PASSWORD_LENGTH = 10;
 
 // SuperTokens users are global, but a login is always *for* one store. The
@@ -38,6 +37,9 @@ const TENANT_ID_KEY = 'comboTenantId';
 const ROLE_KEY = 'comboRole';
 
 const SLUG_PATTERN = /^[a-z0-9-]{1,63}$/;
+// Same looseness as the recipient phone in orders.schema.ts: rejects junk, not formatting.
+const PHONE_PATTERN = /^\+?[0-9 ()-]{7,20}$/;
+const PROFILE_KEY = 'comboSignUpProfile';
 
 type HeaderReader = { getHeaderValue(name: string): string | undefined };
 
@@ -90,97 +92,62 @@ export function initSupertokens(): void {
       websiteBasePath: '/auth',
     },
     recipeList: [
-      // Buyers: email OTP, no password to manage (CLAUDE.md section 7).
-      // Signing in for the first time creates their `users` row.
-      Passwordless.init({
-        contactMethod: 'EMAIL',
-        flowType: 'USER_INPUT_CODE',
-        emailDelivery: {
-          override: (original) => ({
-            ...original,
-            sendEmail: async (input) => {
-              if (!input.userInputCode) {
-                throw new InternalError('Login email requested without a code');
-              }
-              await notificationsService.sendLoginCode(input.email, input.userInputCode);
-            },
-          }),
-        },
-        override: {
-          apis: (original) => ({
-            ...original,
-            // Would let anyone probe which emails have an account.
-            emailExistsGET: undefined,
-            phoneNumberExistsGET: undefined,
-            // Each request here sends a real email, and the per-IP limit in
-            // app.ts can be sidestepped by rotating IPs — so the address
-            // itself is also limited, however the requests arrive.
-            createCodePOST: async (input) => {
-              if (!original.createCodePOST) {
-                throw new InternalError('Passwordless createCodePOST is unavailable');
-              }
-              if ('email' in input) {
-                await enforceLimit(rateLimitStore, OTP_PER_EMAIL, input.email.trim().toLowerCase());
-              }
-              return original.createCodePOST(input);
-            },
-            resendCodePOST: async (input) => {
-              if (!original.resendCodePOST) {
-                throw new InternalError('Passwordless resendCodePOST is unavailable');
-              }
-              await enforceLimit(rateLimitStore, OTP_RESEND_PER_DEVICE, input.deviceId);
-              return original.resendCodePOST(input);
-            },
-            consumeCodePOST: async (input) => {
-              if (!original.consumeCodePOST) {
-                throw new InternalError('Passwordless consumeCodePOST is unavailable');
-              }
-              input.userContext[TENANT_ID_KEY] = await resolveTenantId(input.options.req);
-              return original.consumeCodePOST(input);
-            },
-          }),
-          functions: (original) => ({
-            ...original,
-            consumeCode: async (input) => {
-              const result = await original.consumeCode(input);
-              if (result.status !== 'OK') {
-                return result;
-              }
-              const tenantId = requireContext<string>(input.userContext, TENANT_ID_KEY);
-              // The address the code was sent to is the person's email.
-              const email = result.consumedDevice.email ?? result.user.emails[0];
-              if (!email) {
-                throw new InternalError('Passwordless user has no email');
-              }
-              const user = await identityService.findOrCreateFromSession(tenantId, result.user.id, email);
-              input.userContext[ROLE_KEY] = user.role;
-              return result;
-            },
-          }),
-        },
-      }),
-
-      // Staff (admin, courier): email + password. There is no public signup —
-      // accounts are created by `npm run db:seed:admin`. Password reset is
-      // on, delivered through our own mailer (never SuperTokens' default
-      // sender). Admin 2FA (TOTP) is deliberately not built yet.
+      // Everyone signs in with email + password. Buyers sign themselves up (a
+      // `users` row with role buyer is created for the store they sign up at);
+      // staff (admin, courier) have no public signup — `npm run db:seed:admin`
+      // creates them. Password reset and email verification go through our own
+      // mailer, never SuperTokens' default sender. Admin 2FA (TOTP) is
+      // deliberately not built yet.
       EmailPassword.init({
         signUpFeature: {
-          formFields: [{ id: 'password', validate: async (value) => validatePassword(value) }],
+          formFields: [
+            { id: 'password', validate: async (value) => validatePassword(value) },
+            {
+              id: 'name',
+              validate: async (value) =>
+                typeof value === 'string' && value.trim().length > 0 && value.trim().length <= 255
+                  ? undefined
+                  : 'Name is required (up to 255 characters)',
+            },
+            {
+              id: 'phone',
+              optional: true,
+              validate: async (value) =>
+                value === '' || (typeof value === 'string' && PHONE_PATTERN.test(value.trim())) ? undefined : 'Not a valid phone number',
+            },
+          ],
         },
         emailDelivery: {
           override: (original) => ({
             ...original,
             sendEmail: async (input) => {
-              await notificationsService.sendPasswordResetLink(input.user.email, input.passwordResetLink);
+              // Same idea as the verification link: land on our own page
+              // (/admin/reset-password serves everyone with a password), keeping
+              // SuperTokens' token query.
+              const link = `${config.webBaseUrl}/admin/reset-password${new URL(input.passwordResetLink).search}`;
+              await notificationsService.sendPasswordResetLink(input.user.email, link);
             },
           }),
         },
         override: {
           apis: (original) => ({
             ...original,
-            signUpPOST: undefined,
             emailExistsGET: undefined,
+            // Buyer signup. Like sign-in it is always *for* one store; the
+            // name/phone the form collected ride along in the context to the
+            // signUp function below, which writes them on the new `users` row.
+            signUpPOST: async (input) => {
+              if (!original.signUpPOST) {
+                throw new InternalError('EmailPassword signUpPOST is unavailable');
+              }
+              input.userContext[TENANT_ID_KEY] = await resolveTenantId(input.options.req);
+              const field = (id: string) => {
+                const value = input.formFields.find((f) => f.id === id)?.value;
+                return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
+              };
+              input.userContext[PROFILE_KEY] = { fullName: field('name'), phone: field('phone') };
+              return original.signUpPOST(input);
+            },
             signInPOST: async (input) => {
               if (!original.signInPOST) {
                 throw new InternalError('EmailPassword signInPOST is unavailable');
@@ -225,20 +192,86 @@ export function initSupertokens(): void {
           }),
           functions: (original) => ({
             ...original,
+            signUp: async (input) => {
+              const result = await original.signUp(input);
+              // Only the public signup API sets a tenant; a server-side call
+              // (the admin seed script) creates the login and its own `users` row.
+              const tenantId = input.userContext[TENANT_ID_KEY] as string | undefined;
+              if (result.status !== 'OK' || tenantId === undefined) {
+                return result;
+              }
+              const profile = (input.userContext[PROFILE_KEY] ?? {}) as { fullName?: string; phone?: string };
+              const user = await identityService.findOrCreateFromSession(tenantId, result.user.id, input.email, 'buyer', profile);
+              input.userContext[ROLE_KEY] = user.role;
+              // Ask them to confirm the address, once, right after creating the
+              // account. A mail failure must not undo a signup that worked — they
+              // can ask for another from the verify screen.
+              try {
+                await EmailVerification.sendEmailVerificationEmail(
+                  SUPERTOKENS_TENANT,
+                  result.user.id,
+                  result.recipeUserId,
+                  input.email,
+                  input.userContext,
+                );
+              } catch (err) {
+                logger.error({ err }, 'Could not send the email verification message after signup');
+              }
+              return result;
+            },
             signIn: async (input) => {
               const result = await original.signIn(input);
               if (result.status !== 'OK') {
                 return result;
               }
               const tenantId = requireContext<string>(input.userContext, TENANT_ID_KEY);
-              const user = await identityService.findBySupertokensUserId(tenantId, result.user.id);
-              // Valid password, but no staff account in *this* store (or a
-              // disabled one): indistinguishable from a wrong password.
-              if (!user || user.deletedAt || user.role === 'buyer') {
+              // SuperTokens logins are global, so a person who signed up at one
+              // store has a valid password at every store. Signing in at another
+              // store makes them a buyer there (one `users` row per store) —
+              // staff rows are only ever created by the seed script, so this
+              // cannot grant anyone elevated rights.
+              const user =
+                (await identityService.findBySupertokensUserId(tenantId, result.user.id)) ??
+                (await identityService.findOrCreateFromSession(tenantId, result.user.id, input.email));
+              // A disabled account is indistinguishable from a wrong password.
+              if (user.deletedAt) {
                 return { status: 'WRONG_CREDENTIALS_ERROR' };
               }
               input.userContext[ROLE_KEY] = user.role;
               return result;
+            },
+          }),
+        },
+      }),
+
+      // Buyers confirm their email once after signing up. OPTIONAL: an
+      // unconfirmed buyer can browse, fill a cart and sign in; what needs a
+      // confirmed address (placing an order — receipts and payment notices go
+      // there) is enforced where it matters, by requireVerifiedEmail.
+      EmailVerification.init({
+        mode: 'OPTIONAL',
+        emailDelivery: {
+          override: (original) => ({
+            ...original,
+            sendEmail: async (input) => {
+              // Point the link at our own web app (/account/verify-email; the
+              // locale is added by the web app's middleware) instead of
+              // SuperTokens' default route, keeping its token/tenantId query.
+              const link = `${config.webBaseUrl}/account/verify-email${new URL(input.emailVerifyLink).search}`;
+              await notificationsService.sendEmailVerificationLink(input.user.email, link);
+            },
+          }),
+        },
+        override: {
+          apis: (original) => ({
+            ...original,
+            // "Send me another link" — each call sends a real email.
+            generateEmailVerifyTokenPOST: async (input) => {
+              if (!original.generateEmailVerifyTokenPOST) {
+                throw new InternalError('EmailVerification generateEmailVerifyTokenPOST is unavailable');
+              }
+              await enforceLimit(rateLimitStore, VERIFY_EMAIL_PER_USER, input.session.getUserId());
+              return original.generateEmailVerifyTokenPOST(input);
             },
           }),
         },

@@ -1,7 +1,8 @@
-import { and, asc, desc, eq, inArray, isNull, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gte, inArray, isNull, lt, sql, type SQL } from 'drizzle-orm';
 import type { Transaction } from '../../db/client.js';
 import {
   addresses,
+  orderCounters,
   orderItems,
   orders,
   recipients,
@@ -213,9 +214,113 @@ export async function listItemsForOrders(tx: Transaction, orderIds: string[]): P
   return tx.select().from(orderItems).where(inArray(orderItems.orderId, orderIds));
 }
 
-export async function orderNumberExists(tx: Transaction, orderNumber: string): Promise<boolean> {
-  const [row] = await tx.select({ id: orders.id }).from(orders).where(eq(orders.orderNumber, orderNumber)).limit(1);
-  return row !== undefined;
+// The first order of a store is FC-1001 (a shop whose first receipt says "#1"
+// looks brand new to a buyer who is about to send money abroad).
+const FIRST_ORDER_NUMBER = 1001;
+
+// Atomic: the upsert takes a row lock on this store's counter until the
+// surrounding transaction ends, so concurrent checkouts queue up behind each other.
+export async function nextOrderNumber(tx: Transaction, tenantId: string): Promise<number> {
+  const [row] = await tx
+    .insert(orderCounters)
+    .values({ tenantId, lastNumber: FIRST_ORDER_NUMBER })
+    .onConflictDoUpdate({ target: orderCounters.tenantId, set: { lastNumber: sql`${orderCounters.lastNumber} + 1` } })
+    .returning({ lastNumber: orderCounters.lastNumber });
+  if (!row) {
+    throw new Error('Order counter upsert returned no row');
+  }
+  return row.lastNumber;
+}
+
+// --- sales statistics (admin analytics) ----------------------------------------
+//
+// An order counts as a sale from the moment it is paid until it is refunded or cancelled, and is
+// dated by when it was PAID, not placed. Days are Cuba days (the shop's), not UTC days.
+
+const SALE_STATUSES = ['paid', 'preparing', 'out_for_delivery', 'delivered'];
+
+// A period is [from, to) given as Cuba-local dates ("2026-09-24"); null "to" = open-ended.
+function paidWithin(from: string, to: string | null): SQL {
+  const start = sql`(${from}::timestamp at time zone 'America/Havana')`;
+  const end = to ? sql`(${to}::timestamp at time zone 'America/Havana')` : undefined;
+  return and(inArray(orders.status, SALE_STATUSES), gte(orders.paidAt, start), end ? lt(orders.paidAt, end) : undefined) as SQL;
+}
+
+export interface SalesTotals {
+  orders: number;
+  totalCents: number;
+  freeDeliveryOrders: number;
+}
+
+export async function salesTotals(tx: Transaction, from: string, to: string | null): Promise<SalesTotals> {
+  const [row] = await tx
+    .select({
+      orders: sql<number>`count(*)::int`,
+      totalCents: sql<number>`coalesce(sum(${orders.totalCents}), 0)::int`,
+      freeDeliveryOrders: sql<number>`(count(*) filter (where ${orders.deliveryFeeCents} = 0))::int`,
+    })
+    .from(orders)
+    .where(paidWithin(from, to));
+  return row ?? { orders: 0, totalCents: 0, freeDeliveryOrders: 0 };
+}
+
+export async function salesByBucket(
+  tx: Transaction,
+  from: string,
+  to: string | null,
+  granularity: 'day' | 'month',
+): Promise<Array<{ bucket: string; totalCents: number; orders: number }>> {
+  // The format is one of two constants and is written into the SQL as a literal on purpose: as a bound
+  // parameter, Postgres would see the SELECT and GROUP BY expressions as different and refuse to group.
+  const format = sql.raw(granularity === 'day' ? "'YYYY-MM-DD'" : "'YYYY-MM'");
+  const bucket = sql<string>`to_char(${orders.paidAt} at time zone 'America/Havana', ${format})`;
+  return tx
+    .select({
+      bucket,
+      totalCents: sql<number>`sum(${orders.totalCents})::int`,
+      orders: sql<number>`count(*)::int`,
+    })
+    .from(orders)
+    .where(paidWithin(from, to))
+    .groupBy(bucket)
+    .orderBy(bucket);
+}
+
+export async function salesByMunicipality(
+  tx: Transaction,
+  from: string,
+  to: string | null,
+): Promise<Array<{ provinceId: string; municipalityId: string; orders: number }>> {
+  const provinceId = sql<string>`${orders.addressSnapshot}->>'provinceId'`;
+  const municipalityId = sql<string>`${orders.addressSnapshot}->>'municipalityId'`;
+  return tx
+    .select({ provinceId, municipalityId, orders: sql<number>`count(*)::int` })
+    .from(orders)
+    .where(paidWithin(from, to))
+    .groupBy(provinceId, municipalityId)
+    .orderBy(desc(sql`count(*)`));
+}
+
+export async function topProducts(
+  tx: Transaction,
+  from: string,
+  to: string | null,
+  limit: number,
+): Promise<Array<{ productId: string | null; nameEs: string; nameEn: string | null; quantity: number; totalCents: number }>> {
+  return tx
+    .select({
+      productId: orderItems.productId,
+      nameEs: orderItems.productNameSnapshot,
+      nameEn: orderItems.productNameEnSnapshot,
+      quantity: sql<number>`sum(${orderItems.quantity})::int`,
+      totalCents: sql<number>`sum(${orderItems.lineTotalCents})::int`,
+    })
+    .from(orderItems)
+    .innerJoin(orders, eq(orderItems.orderId, orders.id))
+    .where(paidWithin(from, to))
+    .groupBy(orderItems.productId, orderItems.productNameSnapshot, orderItems.productNameEnSnapshot)
+    .orderBy(desc(sql`sum(${orderItems.quantity})`), desc(sql`sum(${orderItems.lineTotalCents})`))
+    .limit(limit);
 }
 
 interface StatusUpdate {

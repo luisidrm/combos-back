@@ -68,10 +68,14 @@ describe('tenancy module', () => {
         taglineEn: 'Deliveries in Cuba',
         descriptionEs: 'Combos para la familia',
         descriptionEn: null,
+        freeDeliveryOverCents: null,
+        sameDayCutoff: null,
+        contact: { phone: null, email: null, address: null },
+        openingHours: null,
         logo: null,
       });
       expect(Object.keys(view).sort()).toEqual(
-        ['descriptionEn', 'descriptionEs', 'logo', 'name', 'slug', 'taglineEn', 'taglineEs'],
+        ['contact', 'descriptionEn', 'descriptionEs', 'freeDeliveryOverCents', 'logo', 'name', 'openingHours', 'sameDayCutoff', 'slug', 'taglineEn', 'taglineEs'],
       );
     });
 
@@ -114,6 +118,38 @@ describe('tenancy module', () => {
       expect(cleared.name).toBe('Nuevo Nombre');
     });
 
+    it('stores the free-delivery threshold, shows it publicly, and switches it off with null', async () => {
+      const shop = await create('free-delivery');
+      expect((await tenancy.getPublicStore(shop.id)).freeDeliveryOverCents).toBeNull();
+
+      const on = await tenancy.updateStore(shop.id, { settings: { freeDeliveryOverCents: 5000 } });
+      expect(on.freeDeliveryOverCents).toBe(5000);
+      expect(on.settings).toMatchObject({ freeDeliveryOverCents: 5000, requireDeliveryPhoto: false });
+
+      // Changing another switch leaves it alone; null clears it.
+      expect((await tenancy.updateStore(shop.id, { settings: { requireDeliveryPhoto: true } })).settings.freeDeliveryOverCents).toBe(5000);
+      expect((await tenancy.updateStore(shop.id, { settings: { freeDeliveryOverCents: null } })).freeDeliveryOverCents).toBeNull();
+    });
+
+    it('stores contact details, opening hours and the same-day cutoff, and shows them publicly', async () => {
+      const shop = await create('profile');
+      const hours = [...Array(6).fill({ open: '08:00', close: '18:00' }), null];
+      const updated = await tenancy.updateStore(shop.id, {
+        settings: { contact: { phone: '+53 42 21 5566', email: 'pedidos@shop.test', address: 'Calle 1 #2' }, openingHours: hours, sameDayCutoff: '14:00' },
+      });
+      expect(updated).toMatchObject({
+        sameDayCutoff: '14:00',
+        contact: { phone: '+53 42 21 5566', email: 'pedidos@shop.test', address: 'Calle 1 #2' },
+        openingHours: hours,
+      });
+      expect(await tenancy.getPublicStore(shop.id)).toMatchObject({ sameDayCutoff: '14:00', openingHours: hours });
+
+      // A partial contact edit changes only that field; an empty string clears one.
+      const edited = await tenancy.updateStore(shop.id, { settings: { contact: { phone: '' } } });
+      expect(edited.contact).toEqual({ phone: null, email: 'pedidos@shop.test', address: 'Calle 1 #2' });
+      expect((await tenancy.updateStore(shop.id, { settings: { sameDayCutoff: null, openingHours: null } })).sameDayCutoff).toBeNull();
+    });
+
     it('treats an empty edit as a no-op', async () => {
       const shop = await create('no-op');
       const before = await tenancy.getPublicStore(shop.id);
@@ -136,14 +172,15 @@ describe('tenancy module', () => {
   describe('store settings', () => {
     it('defaults to off, and can be switched on and off', async () => {
       const shop = await create('settings');
-      expect(await tenancy.getSettings(shop.id)).toEqual({ requireDeliveryPhoto: false });
+      expect(await tenancy.getSettings(shop.id)).toMatchObject({ requireDeliveryPhoto: false, freeDeliveryOverCents: null });
 
       const on = await tenancy.updateStore(shop.id, { settings: { requireDeliveryPhoto: true } });
-      expect(on.settings).toEqual({ requireDeliveryPhoto: true });
-      expect(await tenancy.getSettings(shop.id)).toEqual({ requireDeliveryPhoto: true });
+      expect(on.settings).toMatchObject({ requireDeliveryPhoto: true, freeDeliveryOverCents: null });
+      expect(await tenancy.getSettings(shop.id)).toMatchObject({ requireDeliveryPhoto: true, freeDeliveryOverCents: null });
 
-      expect((await tenancy.updateStore(shop.id, { settings: { requireDeliveryPhoto: false } })).settings).toEqual({
+      expect((await tenancy.updateStore(shop.id, { settings: { requireDeliveryPhoto: false } })).settings).toMatchObject({
         requireDeliveryPhoto: false,
+        freeDeliveryOverCents: null,
       });
     });
 
@@ -160,7 +197,7 @@ describe('tenancy module', () => {
       const shop = await create('settings-untouched');
       await tenancy.updateStore(shop.id, { settings: { requireDeliveryPhoto: true } });
       await tenancy.updateStore(shop.id, { name: 'Renamed' });
-      expect(await tenancy.getSettings(shop.id)).toEqual({ requireDeliveryPhoto: true });
+      expect(await tenancy.getSettings(shop.id)).toMatchObject({ requireDeliveryPhoto: true, freeDeliveryOverCents: null });
     });
   });
 });

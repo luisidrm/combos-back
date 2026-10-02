@@ -5,7 +5,8 @@ import { tenantIsolationPolicy } from '../../db/rls.js';
 
 // 'tenant' is the one case where owner_id equals tenant_id — a store's
 // logo belongs to the tenant itself, not a separately-owned entity.
-export const mediaOwnerTypes = ['product', 'user', 'delivery', 'tenant'] as const;
+// `payment_proof`: the screenshot a buyer uploads of a manual transfer; owner id = the order id.
+export const mediaOwnerTypes = ['product', 'user', 'delivery', 'tenant', 'payment_proof'] as const;
 export type MediaOwnerType = (typeof mediaOwnerTypes)[number];
 
 export const mediaStatuses = ['pending', 'ready', 'failed'] as const;

@@ -22,8 +22,9 @@ export const mediaRouter = Router();
 // - product: admin only.
 // - tenant: admin only (the store's own logo). The owner id must be the
 //   store itself.
-// - delivery: admin or courier.
+// - delivery: admin, staff or courier (whoever hands the box over).
 // - user: only that user (compared by our internal users.id).
+// - payment_proof: store staff or admin, or the buyer of that order (the owner id is the order id).
 // requireAuth has already re-read the caller from the database, so the role
 // here is current, not the one in an old token. RLS confines everything to
 // the caller's own store; this decides whether their role/identity permits
@@ -42,11 +43,22 @@ async function authorizeOwnerAccess(req: Request, ownerType: MediaOwnerType, own
       throw new ValidationError("A store's logo belongs to the store itself: ownerId must be the store id");
     }
   }
-  if (ownerType === 'delivery' && caller.role !== 'admin' && caller.role !== 'courier') {
-    throw new ForbiddenError('Only an admin or courier can manage a delivery photo');
+  if (ownerType === 'delivery' && caller.role === 'buyer') {
+    throw new ForbiddenError('Only store staff or a courier can manage a delivery photo');
   }
   if (ownerType === 'user' && caller.id !== ownerId) {
     throw new ForbiddenError('You can only manage your own profile picture');
+  }
+  if (ownerType === 'payment_proof') {
+    if (caller.role === 'courier') {
+      throw new ForbiddenError('A courier cannot see payment proofs');
+    }
+    if (caller.role === 'buyer') {
+      // A buyer may only touch the screenshots of their own order (404 otherwise). Loaded at call
+      // time: orders already depends on media's service, so a static import would make a cycle.
+      const { ordersService } = await import('../orders/index.js');
+      await ordersService.getOrderForBuyer(req.tenantId, caller.id, ownerId);
+    }
   }
 }
 

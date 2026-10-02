@@ -1,4 +1,4 @@
-import { desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import type { Transaction } from '../../db/client.js';
 import { paymentEvents, payments, type NewPayment, type NewPaymentEvent, type Payment, type PaymentEvent } from './payments.schema.js';
 
@@ -58,4 +58,22 @@ export async function insertEventIfNew(tx: Transaction, values: NewPaymentEvent)
 
 export async function markEventProcessed(tx: Transaction, id: string): Promise<void> {
   await tx.update(paymentEvents).set({ processedAt: new Date() }).where(eq(paymentEvents.id, id));
+}
+
+// Manual transfers: what the buyer reported (method, confirmation number, note) is stored as an
+// event on the payment, newest wins. Returns each order's latest report with its order id.
+export async function findLatestReports(
+  tx: Transaction,
+  eventType: string,
+  orderIds: string[],
+): Promise<Array<{ orderId: string; payload: unknown; createdAt: Date }>> {
+  if (orderIds.length === 0) return [];
+  const rows = await tx
+    .select({ orderId: payments.orderId, payload: paymentEvents.payload, createdAt: paymentEvents.createdAt })
+    .from(paymentEvents)
+    .innerJoin(payments, eq(paymentEvents.paymentId, payments.id))
+    .where(and(eq(paymentEvents.eventType, eventType), inArray(payments.orderId, orderIds)))
+    .orderBy(desc(paymentEvents.createdAt));
+  const seen = new Set<string>();
+  return rows.filter((row) => (seen.has(row.orderId) ? false : (seen.add(row.orderId), true)));
 }

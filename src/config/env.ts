@@ -10,6 +10,12 @@ function booleanFromString(defaultValue: 'true' | 'false') {
     .transform((value) => value === 'true');
 }
 
+// An env var left blank (`NAME=`) means "not set".
+const optionalText = z
+  .string()
+  .optional()
+  .transform((value) => value?.trim() || undefined);
+
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
@@ -58,6 +64,21 @@ const envSchema = z.object({
 
   RESEND_API_KEY: z.string().min(1),
   EMAIL_FROM: z.string().min(1).default('onboarding@resend.dev'),
+  // Really send emails through Resend? Unset = only in production; elsewhere the message is just logged.
+  // Set `true` to try the real emails in development (with the default sender, Resend only delivers
+  // to the address your Resend account was registered with).
+  SEND_EMAILS: z.enum(['true', 'false']).optional(),
+
+  // Where buyers send money for the manual transfer option (Zelle / Cash App / PayPal). A method is
+  // offered only when its account is set; blank counts as unset. See docs/API.md section 9b.
+  MANUAL_PAYEE_NAME: optionalText,
+  ZELLE_EMAIL: optionalText,
+  CASHAPP_EMAIL: optionalText,
+  // `$cashtag` or `cashtag`: with it the Cash App link opens with the amount already filled in.
+  CASHAPP_CASHTAG: optionalText,
+  PAYPAL_EMAIL: optionalText,
+  // paypal.me handle: with it the PayPal link opens with the amount already filled in.
+  PAYPAL_ME_HANDLE: optionalText,
 
   TROPIPAY_CLIENT_ID: z.string().optional(),
   TROPIPAY_CLIENT_SECRET: z.string().optional(),

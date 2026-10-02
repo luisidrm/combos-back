@@ -70,8 +70,16 @@ describe('orders module: the address book', () => {
   }
 
   beforeAll(async () => {
+    // The config reads the environment once, on first import: set the manual transfer accounts first.
+    process.env.ZELLE_EMAIL = 'pay@example.com';
+    process.env.PAYPAL_EMAIL = 'pay@example.com';
+    process.env.PAYPAL_ME_HANDLE = 'teststore';
     database = await startTestDatabase();
     adminSql = database.adminSql;
+    // quote() reads the store's settings (free-delivery offer), so the stores must exist.
+    for (const id of [tenantA, tenantB]) {
+      await adminSql`INSERT INTO tenants (id, slug, name) VALUES (${id}, ${'t-' + id.slice(0, 8)}, ${'Test store'})`;
+    }
 
     havana = await insertProvince('LHA', 'La Habana');
     santiago = await insertProvince('SCU', 'Santiago de Cuba');
@@ -358,6 +366,21 @@ describe('orders module: the address book', () => {
       await geo.updateZone(tenantA, zoneId, { feeCents: 650 });
     });
 
+    it("waives the zone fee once the subtotal reaches the store's free-delivery threshold", async () => {
+      const pollo = await liveProduct('Quote Free Delivery', 1000);
+      const { buyer, recipientId, addressId } = await buyerWithAddress(vedado, havana);
+      await adminSql`UPDATE tenants SET settings = '{"free_delivery_over_cents": 1500}'::jsonb WHERE id = ${tenantA}`;
+      try {
+        await cart.addItem(tenantA, { userId: buyer }, { productId: pollo.id, quantity: 1 });
+        expect(await orders.quote(tenantA, buyer, { recipientId, addressId })).toMatchObject({ subtotalCents: 1000, deliveryFeeCents: 650, totalCents: 1650 });
+
+        await cart.addItem(tenantA, { userId: buyer }, { productId: pollo.id, quantity: 1 });
+        expect(await orders.quote(tenantA, buyer, { recipientId, addressId })).toMatchObject({ subtotalCents: 2000, deliveryFeeCents: 0, totalCents: 2000 });
+      } finally {
+        await adminSql`UPDATE tenants SET settings = '{}'::jsonb WHERE id = ${tenantA}`;
+      }
+    });
+
     it('says why an empty cart cannot check out', async () => {
       const { buyer, recipientId, addressId } = await buyerWithAddress(vedado, havana);
       const quote = await orders.quote(tenantA, buyer, { recipientId, addressId });
@@ -485,8 +508,11 @@ describe('orders module: the address book', () => {
         const arroz = await liveProduct('Checkout Arroz', 950);
         const { buyer, order, checkoutUrl } = await checkoutAs('manual', arroz.id, 2);
 
+        expect(order.items[0]).toHaveProperty('productNameEn');
+        expect(order.items[0]).toHaveProperty('productThumbUrl');
+        expect(order.addressSnapshot).toHaveProperty('neighborhood');
         expect(order.status).toBe('pending_payment');
-        expect(order.orderNumber).toMatch(/^ORD-[A-Z0-9]{8}$/);
+        expect(order.orderNumber).toMatch(/^FC-[0-9]{4,}$/);
         expect(order).toMatchObject({ subtotalCents: 1900, deliveryFeeCents: 500, totalCents: 2400, currency: 'USD' });
         expect(order.items).toEqual([
           expect.objectContaining({ productId: arroz.id, productNameEs: 'Checkout Arroz', quantity: 2, unitPriceCents: 950, lineTotalCents: 1900 }),
@@ -542,11 +568,13 @@ describe('orders module: the address book', () => {
         );
       });
 
-      it('generates a fresh order number for every order', async () => {
+      it('numbers orders sequentially within a store, FC-1001 upward', async () => {
         const p = await liveProduct('Checkout Numbers', 200);
         const first = await checkoutAs('manual', p.id);
         const second = await checkoutAs('manual', p.id);
-        expect(first.order.orderNumber).not.toBe(second.order.orderNumber);
+        const n = (order: { orderNumber: string }) => Number(order.orderNumber.replace('FC-', ''));
+        expect(n(first.order)).toBeGreaterThanOrEqual(1001);
+        expect(n(second.order)).toBe(n(first.order) + 1);
       });
     });
 
@@ -591,6 +619,238 @@ describe('orders module: the address book', () => {
         const cancelled = await orders.listOrdersForAdmin(tenantA, { status: 'cancelled' });
         expect(cancelled.map((o) => o.id)).toContain(order.id);
         expect((await orders.listOrdersForAdmin(tenantA, { status: 'paid' })).map((o) => o.id)).not.toContain(order.id);
+      });
+    });
+
+    describe('the admin queue', () => {
+      it('shows who bought and how many items each order holds', async () => {
+        const p = await liveProduct('Queue Buyer', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id, 3);
+        await adminSql`UPDATE users SET full_name = 'Ana Pérez' WHERE id = ${buyer}`;
+
+        const row = (await orders.listOrdersForAdmin(tenantA, {})).find((o) => o.id === order.id);
+        expect(row).toMatchObject({ itemCount: 3, buyer: { fullName: 'Ana Pérez' } });
+        expect(row?.buyer?.email).toMatch(/@example\.com$/);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).buyer?.fullName).toBe('Ana Pérez');
+      });
+
+      it('moves a paid order along: preparing -> out_for_delivery -> delivered', async () => {
+        const p = await liveProduct('Queue Flow', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+
+        expect((await orders.adminMarkOutForDelivery(tenantA, adminUser, order.id)).status).toBe('out_for_delivery');
+        const delivered = await orders.adminMarkDelivered(tenantA, adminUser, order.id);
+        expect(delivered.status).toBe('delivered');
+        expect(delivered.deliveredAt).not.toBeNull();
+      });
+
+      it('will not skip a step', async () => {
+        const p = await liveProduct('Queue Skip', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        const failed = await orders.adminMarkOutForDelivery(tenantA, adminUser, order.id).catch((err: unknown) => err);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'ILLEGAL_TRANSITION', from: 'paid', to: 'out_for_delivery' });
+      });
+
+      it('refuses "delivered" while the store requires a delivery photo (proof arrives with M4)', async () => {
+        const p = await liveProduct('Queue Photo', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+        await orders.adminMarkOutForDelivery(tenantA, adminUser, order.id);
+
+        await adminSql`UPDATE tenants SET settings = '{"require_delivery_photo": true}'::jsonb WHERE id = ${tenantA}`;
+        try {
+          const failed = await orders.adminMarkDelivered(tenantA, adminUser, order.id).catch((err: unknown) => err);
+          expect(failed).toBeInstanceOf(ConflictError);
+          expect((failed as ConflictError).details).toMatchObject({ reason: 'DELIVERY_PHOTO_REQUIRED' });
+        } finally {
+          await adminSql`UPDATE tenants SET settings = '{}'::jsonb WHERE id = ${tenantA}`;
+        }
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('out_for_delivery');
+      });
+    });
+
+    describe('manual transfer', () => {
+      async function manualOrder(name: string) {
+        const p = await liveProduct(name, 1250);
+        return checkoutAs('manual', p.id, 2); // total 2500 + 500 delivery
+      }
+
+      async function addScreenshot(orderId: string, status = 'ready') {
+        await adminSql`
+          INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
+          VALUES (${tenantA}, 'payment_proof', ${orderId}, 'o.jpg', 'public/t.webp', 'public/c.webp', 'public/f.webp', ${status})`;
+      }
+
+      it('tells the buyer who to pay and exactly how much, with the order number as the reference', async () => {
+        const { buyer, order } = await manualOrder('Manual Instructions');
+        const info = await orders.getPaymentInstructions(tenantA, buyer, order.id);
+        expect(info).toMatchObject({ orderId: order.id, amountCents: 3000, currency: 'USD', reference: order.orderNumber, report: null });
+        const paypal = info?.methods.find((m) => m.method === 'paypal');
+        expect(paypal).toMatchObject({ amountInLink: true, link: 'https://www.paypal.com/paypalme/teststore/30.00USD' });
+        expect(info?.methods.map((m) => m.method)).toEqual(expect.arrayContaining(['zelle', 'paypal']));
+      });
+
+      it('has no instructions for a card order, and shows them only to the buyer of that order', async () => {
+        const p = await liveProduct('Manual Card', 800);
+        const card = await checkoutAs('tropipay', p.id);
+        expect(await orders.getPaymentInstructions(tenantA, card.buyer, card.order.id)).toBeNull();
+
+        const { order } = await manualOrder('Manual Privacy');
+        await expect(orders.getPaymentInstructions(tenantA, crypto.randomUUID(), order.id)).rejects.toBeInstanceOf(NotFoundError);
+      });
+
+      it('needs a screenshot before a transfer can be reported', async () => {
+        const { buyer, order } = await manualOrder('Manual No Shot');
+        const failed = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'ABC123' }).catch((e: unknown) => e);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'SCREENSHOT_REQUIRED' });
+
+        await addScreenshot(order.id, 'failed'); // a failed upload does not count
+        const stillFailed = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'ABC123' }).catch((e: unknown) => e);
+        expect((stillFailed as ConflictError).details).toMatchObject({ reason: 'SCREENSHOT_REQUIRED' });
+      });
+
+      it('refuses a method the store does not accept', async () => {
+        const { buyer, order } = await manualOrder('Manual Bad Method');
+        await addScreenshot(order.id);
+        await expect(orders.reportTransfer(tenantA, buyer, order.id, { method: 'venmo', transferReference: 'ABC123' })).rejects.toBeInstanceOf(ValidationError);
+      });
+
+      it('records the report, flags the order for the admin, and the admin marks it paid', async () => {
+        const { buyer, order } = await manualOrder('Manual Report');
+        await addScreenshot(order.id);
+        const info = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'paypal', transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
+        expect(info.report).toMatchObject({ method: 'paypal', transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
+
+        const row = (await orders.listOrdersForAdmin(tenantA, {})).find((o) => o.id === order.id);
+        expect(row?.transferReported).toBe(true);
+        const detail = await orders.getOrderForAdmin(tenantA, order.id);
+        expect(detail).toMatchObject({ paymentProvider: 'manual', paymentReport: { method: 'paypal', transferReference: '9XJ12345K' } });
+
+        await orders.adminMarkPaid(tenantA, adminUser, order.id, 'Seen in PayPal');
+        const after = (await orders.listOrdersForAdmin(tenantA, {})).find((o) => o.id === order.id);
+        expect(after).toMatchObject({ status: 'paid', transferReported: false });
+      });
+
+      it('keeps the latest report when the buyer corrects it, and refuses once paid', async () => {
+        const { buyer, order } = await manualOrder('Manual Correct');
+        await addScreenshot(order.id);
+        await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'FIRST1' });
+        await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'SECOND2' });
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).paymentReport?.transferReference).toBe('SECOND2');
+
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        const late = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'LATE3' }).catch((e: unknown) => e);
+        expect((late as ConflictError).details).toMatchObject({ reason: 'NOT_PENDING_PAYMENT' });
+      });
+    });
+
+    describe('delivery proof and status events', () => {
+      async function outForDelivery(name: string) {
+        const p = await liveProduct(name, 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+        await orders.adminMarkOutForDelivery(tenantA, adminUser, order.id);
+        return order;
+      }
+
+      async function addReadyPhoto(orderId: string) {
+        await adminSql`
+          INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
+          VALUES (${tenantA}, 'delivery', ${orderId}, 'o.jpg', 'public/t.webp', 'public/c.webp', 'public/f.webp', 'ready')`;
+      }
+
+      const confirm = async (orderId: string, name = 'Carmen') =>
+        (await import('../fulfilment/index.js')).fulfilmentService.confirmDelivery(tenantA, adminUser, orderId, { recipientName: name });
+
+      it('records who received the order and marks it delivered', async () => {
+        const order = await outForDelivery('Proof Ok');
+        const proof = await confirm(order.id, 'Carmen Díaz');
+        expect(proof).toMatchObject({ orderId: order.id, recipientName: 'Carmen Díaz', photos: [] });
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('delivered');
+        const again = await confirm(order.id, 'Someone else'); // a retry after a dropped connection
+        expect(again.recipientName).toBe('Carmen Díaz');
+      });
+
+      it('requires a ready photo when the store asks for one, and accepts it once there is one', async () => {
+        const order = await outForDelivery('Proof Photo');
+        await adminSql`UPDATE tenants SET settings = '{"require_delivery_photo": true}'::jsonb WHERE id = ${tenantA}`;
+        try {
+          const failed = await confirm(order.id).catch((err: unknown) => err);
+          expect((failed as ConflictError).details).toMatchObject({ reason: 'DELIVERY_PHOTO_REQUIRED' });
+          expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('out_for_delivery');
+
+          await addReadyPhoto(order.id);
+          const proof = await confirm(order.id);
+          expect(proof.photos).toHaveLength(1);
+          expect(proof.photos[0]?.fullUrl).toContain('f.webp');
+        } finally {
+          await adminSql`UPDATE tenants SET settings = '{}'::jsonb WHERE id = ${tenantA}`;
+        }
+      });
+
+      it('only delivers an order that is out for delivery', async () => {
+        const p = await liveProduct('Proof Early', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        const failed = await confirm(order.id).catch((err: unknown) => err);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'ILLEGAL_TRANSITION' });
+      });
+
+      it("keeps one store's proof out of another's", async () => {
+        const order = await outForDelivery('Proof Tenant');
+        await confirm(order.id);
+        const { fulfilmentService } = await import('../fulfilment/index.js');
+        expect(await fulfilmentService.getProof(tenantB, order.id)).toBeNull();
+      });
+
+      it('announces a status change once, not on a repeat', async () => {
+        const { events } = await import('../../core/events.js');
+        const emit = vi.mocked(events.emit);
+        const p = await liveProduct('Event Once', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        emit.mockClear();
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        const paid = emit.mock.calls.filter(([name]) => name === 'order.status_changed');
+        expect(paid).toHaveLength(1);
+        expect(paid[0]?.[1]).toMatchObject({ orderId: order.id, tenantId: tenantA, status: 'paid' });
+      });
+    });
+
+    describe('sales statistics', () => {
+      it('counts paid orders only, with totals, a zero-filled series, places and top products', async () => {
+        const p = await liveProduct('Stats Product', 1000);
+        const paid = await checkoutAs('manual', p.id, 2);
+        await orders.adminMarkPaid(tenantA, adminUser, paid.order.id);
+        await checkoutAs('manual', p.id, 5); // left unpaid: must not count
+
+        const stats = await orders.getSalesStats(tenantA, 'week');
+        expect(stats).toMatchObject({ range: 'week', granularity: 'day', currency: 'USD' });
+        expect(stats.series).toHaveLength(7);
+        expect(stats.series.at(-1)?.totalCents).toBeGreaterThanOrEqual(paid.order.totalCents);
+
+        const mine = stats.topProducts.find((row) => row.nameEs === 'Stats Product');
+        expect(mine).toMatchObject({ quantity: 2, totalCents: 2000 });
+        expect(stats.byMunicipality.some((row) => row.municipalityId === checkoutMunicipality)).toBe(true);
+        expect(stats.current.averageTicketCents).toBe(Math.round(stats.current.totalCents / stats.current.orders));
+        expect(stats.series.reduce((sum, bucket) => sum + bucket.totalCents, 0)).toBe(stats.current.totalCents);
+      });
+
+      it('has 12 monthly buckets for a year and a previous period to compare with', async () => {
+        const stats = await orders.getSalesStats(tenantA, 'year');
+        expect(stats.granularity).toBe('month');
+        expect(stats.series).toHaveLength(12);
+        expect(stats.previous.orders).toBe(0);
+      });
+
+      it("never includes another store's sales", async () => {
+        const stats = await orders.getSalesStats(tenantB, 'month');
+        expect(stats.current).toMatchObject({ orders: 0, totalCents: 0 });
+        expect(stats.topProducts).toEqual([]);
       });
     });
 
@@ -760,6 +1020,21 @@ describe('orders module: the address book', () => {
         const { withTenant } = await import('../../db/client.js');
         const refused = await withTenant(tenantB, (tx) => tx.execute(sql`select * from order_items where order_id = ${order.id}`));
         expect((refused as unknown as unknown[]).length).toBe(0);
+      });
+
+      it("keeps order numbering per store: tenant B cannot read or advance tenant A's counter", async () => {
+        const p = await liveProduct('Isolation Counter', 600);
+        await checkoutAs('manual', p.id); // makes sure tenant A has a counter row
+        const counters = await adminSql`select count(*)::int as n from order_counters where tenant_id = ${tenantA}`;
+        expect(counters[0]?.n).toBe(1);
+
+        const { withTenant } = await import('../../db/client.js');
+        const refused = await withTenant(tenantB, (tx) => tx.execute(sql`select * from order_counters where tenant_id = ${tenantA}`));
+        expect((refused as unknown as unknown[]).length).toBe(0);
+        // Nor can tenant B write a counter row under tenant A's id (RLS WITH CHECK).
+        await expect(
+          withTenant(tenantB, (tx) => tx.execute(sql`insert into order_counters (tenant_id, last_number) values (${tenantA}, 1)`)),
+        ).rejects.toBeDefined();
       });
     });
   });

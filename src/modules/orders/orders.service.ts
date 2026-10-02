@@ -1,5 +1,5 @@
-import { randomBytes } from 'node:crypto';
-import { ConflictError, NotFoundError } from '../../core/errors.js';
+import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { events } from '../../core/events.js';
 import { logger } from '../../core/logger.js';
 import { withTenant, type Transaction } from '../../db/client.js';
 import { config } from '../../config/index.js';
@@ -7,7 +7,9 @@ import { auditService } from '../audit/index.js';
 import { cartService, type CartLineView, type CartView } from '../cart/index.js';
 import { geoService, type DeliveryZoneView } from '../geo/index.js';
 import { identityService } from '../identity/index.js';
-import { paymentsService, type ProviderName } from '../payments/index.js';
+import { mediaService } from '../media/index.js';
+import { paymentsService, type ManualMethodView, type ProviderName, type TransferReport } from '../payments/index.js';
+import { tenancyService } from '../tenancy/index.js';
 import * as ordersRepo from './orders.repo.js';
 import { orderStatuses } from './orders.schema.js';
 import type {
@@ -40,6 +42,7 @@ export interface AddressView {
   street: string;
   betweenStreets: string | null;
   buildingApartment: string | null;
+  neighborhood: string | null;
   referencePoints: string | null;
   lat: number | null;
   lng: number | null;
@@ -63,6 +66,7 @@ function toAddressView(row: Address): AddressView {
     street: row.street,
     betweenStreets: row.betweenStreets,
     buildingApartment: row.buildingApartment,
+    neighborhood: row.neighborhood,
     referencePoints: row.referencePoints,
     // numeric columns come back from the driver as strings.
     lat: row.lat === null ? null : Number(row.lat),
@@ -93,6 +97,7 @@ function addressColumns(input: UpdateAddressInput) {
     street: input.street,
     betweenStreets: input.betweenStreets,
     buildingApartment: input.buildingApartment,
+    neighborhood: input.neighborhood,
     referencePoints: input.referencePoints,
     lat: lat === undefined ? undefined : lat === null ? null : lat.toFixed(6),
     lng: lng === undefined ? undefined : lng === null ? null : lng.toFixed(6),
@@ -321,6 +326,7 @@ async function quote(tenantId: string, buyerUserId: string, input: QuoteInput): 
 
   const cart = await cartService.getCart(tenantId, { userId: buyerUserId });
   const delivery = (await geoService.getActiveZoneForMunicipality(tenantId, municipalityId)) ?? null;
+  const { freeDeliveryOverCents } = await tenancyService.getSettings(tenantId);
 
   const blockers: QuoteBlocker[] = [];
   if (cart.items.length === 0) {
@@ -334,7 +340,9 @@ async function quote(tenantId: string, buyerUserId: string, input: QuoteInput): 
 
   // Without a zone there is no fee to charge, so the total is just the
   // subtotal — but canCheckout is false, so it is never charged.
-  const deliveryFeeCents = delivery?.feeCents ?? 0;
+  // The store's "free delivery from $X" offer waives the zone fee.
+  const freeDelivery = freeDeliveryOverCents !== null && cart.subtotalCents >= freeDeliveryOverCents;
+  const deliveryFeeCents = freeDelivery ? 0 : (delivery?.feeCents ?? 0);
   return {
     cart,
     delivery,
@@ -371,10 +379,47 @@ export interface OrderView {
 export interface OrderItemView {
   productId: string | null;
   productNameEs: string;
+  // Both null on orders placed before they were recorded.
+  productNameEn: string | null;
+  productThumbUrl: string | null;
   unitLabel: string;
   unitPriceCents: number;
   quantity: number;
   lineTotalCents: number;
+}
+
+// The admin queue shows who bought and how much was in the box, which a buyer's own view does not need.
+export interface BuyerSummary {
+  fullName: string | null;
+  email: string;
+}
+export interface AdminOrderListItem extends OrderView {
+  buyer: BuyerSummary | null;
+  itemCount: number;
+  /** A manual transfer the buyer says they sent, still waiting for someone to check it. */
+  transferReported: boolean;
+}
+
+// What an admin sees on one order beyond the buyer's own view: who bought, how it is being paid, and
+// what the buyer reported for a manual transfer (the screenshots are read through /media/manage).
+export type AdminOrderDetail = OrderDetailView & {
+  buyer: BuyerSummary | null;
+  paymentProvider: string | null;
+  paymentReport: TransferReport | null;
+};
+
+// How to pay a manual-transfer order: who to pay, exactly how much, and the reference to quote.
+export interface PaymentInstructions {
+  orderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  amountCents: number;
+  currency: string;
+  /** Goes in the transfer's note so the store can match the money to the order. */
+  reference: string;
+  methods: ManualMethodView[];
+  /** The latest report the buyer sent, if any. */
+  report: TransferReport | null;
 }
 
 export interface OrderDetailView extends OrderView {
@@ -406,6 +451,8 @@ function toOrderItemView(row: OrderItem): OrderItemView {
   return {
     productId: row.productId,
     productNameEs: row.productNameSnapshot,
+    productNameEn: row.productNameEnSnapshot,
+    productThumbUrl: row.productThumbUrlSnapshot,
     unitLabel: row.unitLabelSnapshot,
     unitPriceCents: row.unitPriceCents,
     quantity: row.quantity,
@@ -413,28 +460,11 @@ function toOrderItemView(row: OrderItem): OrderItemView {
   };
 }
 
-// "ORD-" + 8 chars from an alphabet with no 0/O/1/I/L — a human reading it
-// back over the phone (a courier confirming an order with an admin) can't
-// confuse similar-looking characters.
-const ORDER_NUMBER_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
-
-function generateOrderNumber(): string {
-  const bytes = randomBytes(8);
-  let code = '';
-  for (const byte of bytes) {
-    code += ORDER_NUMBER_ALPHABET[byte % ORDER_NUMBER_ALPHABET.length];
-  }
-  return `ORD-${code}`;
-}
-
-async function uniqueOrderNumber(tx: Transaction): Promise<string> {
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const candidate = generateOrderNumber();
-    if (!(await ordersRepo.orderNumberExists(tx, candidate))) {
-      return candidate;
-    }
-  }
-  throw new ConflictError('Could not generate a free order number');
+// Human-readable, per-store, sequential: FC-1001, FC-1002, ... The counter row is
+// bumped inside the checkout transaction, so two concurrent checkouts serialize on
+// it (never the same number) and a rolled-back checkout gives its number back.
+async function nextOrderNumber(tx: Transaction, tenantId: string): Promise<string> {
+  return `FC-${await ordersRepo.nextOrderNumber(tx, tenantId)}`;
 }
 
 // Every product on a checkout-ready cart has a non-null `product` (cart.ts
@@ -492,7 +522,7 @@ async function checkout(
     }
     const recipient = await requireRecipient(tx, buyerUserId, input.recipientId);
 
-    const orderNumber = await uniqueOrderNumber(tx);
+    const orderNumber = await nextOrderNumber(tx, tenantId);
     const insertedOrder = await ordersRepo.insertOrder(tx, {
       tenantId,
       orderNumber,
@@ -525,6 +555,8 @@ async function checkout(
         orderId: insertedOrder.id,
         productId: line.productId,
         productNameSnapshot: product.nameEs,
+        productNameEnSnapshot: product.nameEn,
+        productThumbUrlSnapshot: product.picture?.thumbUrl ?? null,
         unitLabelSnapshot: product.unitLabel,
         unitPriceCents: product.unitPriceCents,
         quantity: line.quantity,
@@ -594,8 +626,8 @@ async function startProviderCheckout(
       currency: order.currency,
       description: `Order ${order.orderNumber}`,
       buyerEmail: buyer.email,
-      returnUrl: `${config.webBaseUrl}/orders/${order.id}?payment=success`,
-      cancelUrl: `${config.webBaseUrl}/orders/${order.id}?payment=cancelled`,
+      returnUrl: `${config.webBaseUrl}/account/orders/${order.id}?payment=success`,
+      cancelUrl: `${config.webBaseUrl}/account/orders/${order.id}?payment=cancelled`,
     });
     await withTenant(tenantId, (tx) => paymentsService.attachExternalId(tx, paymentId, session.externalPaymentId));
     return session.redirectUrl || null;
@@ -618,17 +650,123 @@ async function listOrdersForBuyer(tenantId: string, buyerUserId: string): Promis
   return rows.map(toOrderView);
 }
 
-async function getOrderForAdmin(tenantId: string, orderId: string): Promise<OrderDetailView> {
-  return withTenant(tenantId, async (tx) => {
-    const order = await requireOrder(tx, orderId);
-    const items = await ordersRepo.listItems(tx, orderId);
-    return { ...toOrderView(order), items: items.map(toOrderItemView) };
+async function getOrderForAdmin(tenantId: string, orderId: string): Promise<AdminOrderDetail> {
+  const { order, items, payment, reports } = await withTenant(tenantId, async (tx) => {
+    const found = await requireOrder(tx, orderId);
+    return {
+      order: found,
+      items: await ordersRepo.listItems(tx, orderId),
+      payment: await paymentsService.getLatestForOrder(tx, orderId).catch(() => null),
+      reports: await paymentsService.getLatestTransferReports(tx, [orderId]),
+    };
   });
+  const buyers = await identityService.getSummaries(tenantId, [order.buyerUserId]);
+  return {
+    ...toOrderView(order),
+    items: items.map(toOrderItemView),
+    buyer: buyers.get(order.buyerUserId) ?? null,
+    paymentProvider: payment?.provider ?? null,
+    paymentReport: reports.get(orderId) ?? null,
+  };
 }
 
-async function listOrdersForAdmin(tenantId: string, filter: { status?: OrderStatus }): Promise<OrderView[]> {
-  const rows = await withTenant(tenantId, (tx) => ordersRepo.listForAdmin(tx, filter));
-  return rows.map(toOrderView);
+async function listOrdersForAdmin(tenantId: string, filter: { status?: OrderStatus }): Promise<AdminOrderListItem[]> {
+  const { rows, items, reports } = await withTenant(tenantId, async (tx) => {
+    const found = await ordersRepo.listForAdmin(tx, filter);
+    const ids = found.map((order) => order.id);
+    return {
+      rows: found,
+      items: await ordersRepo.listItemsForOrders(tx, ids),
+      reports: await paymentsService.getLatestTransferReports(tx, ids),
+    };
+  });
+  const buyers = await identityService.getSummaries(tenantId, rows.map((order) => order.buyerUserId));
+  const counts = new Map<string, number>();
+  for (const item of items) {
+    counts.set(item.orderId, (counts.get(item.orderId) ?? 0) + item.quantity);
+  }
+  return rows.map((order) => ({
+    ...toOrderView(order),
+    buyer: buyers.get(order.buyerUserId) ?? null,
+    itemCount: counts.get(order.id) ?? 0,
+    transferReported: order.status === 'pending_payment' && reports.has(order.id),
+  }));
+}
+
+// --- manual transfer (Zelle / Cash App / PayPal) -------------------------------
+//
+// The buyer pays from their own app, then reports it: which app, the confirmation number it showed
+// and a screenshot. Nobody confirms the money automatically — an admin looks at the store's account
+// and uses mark-paid. The report is evidence for that person, not a payment.
+
+// How to pay this order, or null when it is not a manual-transfer order.
+async function getPaymentInstructions(tenantId: string, buyerUserId: string, orderId: string): Promise<PaymentInstructions | null> {
+  const { order, payment, reports } = await withTenant(tenantId, async (tx) => {
+    const found = await requireOrderForBuyer(tx, buyerUserId, orderId);
+    return {
+      order: found,
+      payment: await paymentsService.getLatestForOrder(tx, orderId),
+      reports: await paymentsService.getLatestTransferReports(tx, [orderId]),
+    };
+  });
+  if (payment.provider !== 'manual') return null;
+  return {
+    orderId,
+    orderNumber: order.orderNumber,
+    status: order.status as OrderStatus,
+    amountCents: order.totalCents,
+    currency: order.currency,
+    reference: order.orderNumber,
+    methods: paymentsService.listManualMethods(order.totalCents),
+    report: reports.get(orderId) ?? null,
+  };
+}
+
+async function reportTransfer(
+  tenantId: string,
+  buyerUserId: string,
+  orderId: string,
+  input: { method: string; transferReference: string; notes?: string | null },
+): Promise<PaymentInstructions> {
+  const order = await withTenant(tenantId, (tx) => requireOrderForBuyer(tx, buyerUserId, orderId));
+  if (order.status !== 'pending_payment') {
+    throw new ConflictError('Only an order still waiting for payment can have a transfer reported', { reason: 'NOT_PENDING_PAYMENT' });
+  }
+  const methods = paymentsService.listManualMethods(order.totalCents);
+  const method = methods.find((m) => m.method === input.method);
+  if (!method) {
+    throw new ValidationError(`"${input.method}" is not a payment method this store accepts`);
+  }
+  // The admin decides from the screenshot, so one has to exist (a failed upload does not count).
+  const shots = await mediaService.listForManagement(tenantId, 'payment_proof', orderId);
+  if (!shots.some((s) => s.status !== 'failed')) {
+    throw new ConflictError('Upload a screenshot of the transfer first', { reason: 'SCREENSHOT_REQUIRED' });
+  }
+
+  await withTenant(tenantId, async (tx) => {
+    const payment = await paymentsService.getLatestForOrder(tx, orderId);
+    if (payment.provider !== 'manual') {
+      throw new ConflictError('This order is not paid by manual transfer', { reason: 'NOT_MANUAL_PAYMENT' });
+    }
+    await paymentsService.recordTransferReport(tx, {
+      tenantId,
+      paymentId: payment.id,
+      method: method.method,
+      transferReference: input.transferReference,
+      notes: input.notes,
+    });
+    await auditService.record(tx, {
+      tenantId,
+      actorUserId: buyerUserId,
+      entityType: 'order',
+      entityId: orderId,
+      action: 'order.transfer_reported',
+      note: method.label,
+    });
+  });
+  const result = await getPaymentInstructions(tenantId, buyerUserId, orderId);
+  if (!result) throw new ConflictError('This order is not paid by manual transfer', { reason: 'NOT_MANUAL_PAYMENT' });
+  return result;
 }
 
 // Re-attempts starting a checkout session for an order whose payment is
@@ -710,6 +848,32 @@ async function transition(
   return updated;
 }
 
+// A transition that also reports whether the order actually moved (an already-there order is
+// returned unchanged, see transition), so callers announce real changes only.
+async function transitionTracked(
+  tx: Transaction,
+  tenantId: string,
+  orderId: string,
+  toStatus: OrderStatus,
+  actorUserId: string | undefined,
+  note?: string,
+): Promise<{ order: Order; changed: boolean }> {
+  const before = await requireOrder(tx, orderId);
+  const order = await transition(tx, tenantId, orderId, toStatus, actorUserId, note);
+  return { order, changed: before.status !== order.status };
+}
+
+// Tells the rest of the system an order moved, for emails and the like. Called after the
+// transaction has committed, never inside it, and never fails the request: a lost notification is
+// worse than nothing only if the status change itself is lost, and that has already been saved.
+async function announceStatus(tenantId: string, orderId: string, status: OrderStatus): Promise<void> {
+  try {
+    await events.emit('order.status_changed', { orderId, tenantId, status });
+  } catch (err) {
+    logger.warn({ err, orderId }, 'Could not announce an order status change');
+  }
+}
+
 // A buyer may only back out before paying — after that, cancelling money
 // that has already changed hands is a refund, not a cancel (see the
 // transition table above), and refunds are an admin action.
@@ -729,18 +893,146 @@ async function adminCancel(tenantId: string, actorUserId: string, orderId: strin
 // transfer, since a missed webhook is exactly the kind of gap this exists to
 // cover. Flips the payment row alongside the order, in one transaction.
 async function adminMarkPaid(tenantId: string, actorUserId: string, orderId: string, note?: string): Promise<OrderView> {
-  return withTenant(tenantId, async (tx) => {
-    const order = await transition(tx, tenantId, orderId, 'paid', actorUserId, note ?? 'Confirmed by admin');
+  const { order, changed } = await withTenant(tenantId, async (tx) => {
+    const result = await transitionTracked(tx, tenantId, orderId, 'paid', actorUserId, note ?? 'Confirmed by admin');
     const payment = await paymentsService.getLatestForOrder(tx, orderId);
     if (payment.status !== 'paid') {
       await paymentsService.markStatus(tx, payment.id, 'paid');
     }
-    return toOrderView(order);
+    return result;
   });
+  if (changed) await announceStatus(tenantId, orderId, 'paid');
+  return toOrderView(order);
 }
 
 async function adminMarkPreparing(tenantId: string, actorUserId: string, orderId: string, note?: string): Promise<OrderView> {
   return withTenant(tenantId, async (tx) => toOrderView(await transition(tx, tenantId, orderId, 'preparing', actorUserId, note)));
+}
+
+async function adminMarkOutForDelivery(tenantId: string, actorUserId: string, orderId: string, note?: string): Promise<OrderView> {
+  const { order, changed } = await withTenant(tenantId, (tx) => transitionTracked(tx, tenantId, orderId, 'out_for_delivery', actorUserId, note));
+  if (changed) await announceStatus(tenantId, orderId, 'out_for_delivery');
+  return toOrderView(order);
+}
+
+// A store that requires proof of delivery cannot mark an order delivered without it. The proof
+// (photo + recipient name) is recorded by the fulfilment module, which calls this with
+// proofRecorded after checking it; a bare call (the admin button) is refused for those stores
+// rather than quietly skipping the rule.
+async function adminMarkDelivered(
+  tenantId: string,
+  actorUserId: string,
+  orderId: string,
+  note?: string,
+  opts: { proofRecorded?: boolean } = {},
+): Promise<OrderView> {
+  const settings = await tenancyService.getSettings(tenantId);
+  const { order, changed } = await withTenant(tenantId, async (tx) => {
+    const found = await requireOrder(tx, orderId);
+    if (settings.requireDeliveryPhoto && !opts.proofRecorded && found.status !== 'delivered') {
+      throw new ConflictError('This store requires a delivery photo before an order can be marked delivered', {
+        reason: 'DELIVERY_PHOTO_REQUIRED',
+      });
+    }
+    return transitionTracked(tx, tenantId, orderId, 'delivered', actorUserId, note);
+  });
+  if (changed) await announceStatus(tenantId, orderId, 'delivered');
+  return toOrderView(order);
+}
+
+// --- analytics -------------------------------------------------------------
+
+export type StatsRange = 'week' | 'month' | 'year';
+
+export interface PeriodTotals {
+  orders: number;
+  totalCents: number;
+  averageTicketCents: number;
+  /** Share of the period's orders that shipped free, 0..1. */
+  freeDeliveryShare: number;
+}
+
+export interface SalesStats {
+  range: StatsRange;
+  currency: 'USD';
+  granularity: 'day' | 'month';
+  current: PeriodTotals;
+  /** The same-length period right before, for the "vs. last week" comparison. */
+  previous: PeriodTotals;
+  /** One entry per day (week, month) or per month (year), oldest first, empty buckets included. */
+  series: Array<{ bucket: string; totalCents: number; orders: number }>;
+  byMunicipality: Array<{ provinceId: string; municipalityId: string; orders: number }>;
+  topProducts: Array<{ productId: string | null; nameEs: string; nameEn: string | null; quantity: number; totalCents: number }>;
+}
+
+const HAVANA = 'America/Havana';
+
+// Dates are handled as plain "YYYY-MM-DD" strings so daylight-saving never shifts a bucket.
+function havanaToday(now: Date): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: HAVANA }).format(now);
+}
+function shiftDays(date: string, days: number): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+function shiftMonths(month: string, months: number): string {
+  const [year, mon] = month.split('-').map(Number) as [number, number];
+  const d = new Date(Date.UTC(year, mon - 1 + months, 1));
+  return d.toISOString().slice(0, 7);
+}
+
+function toPeriodTotals(raw: ordersRepo.SalesTotals): PeriodTotals {
+  return {
+    orders: raw.orders,
+    totalCents: raw.totalCents,
+    averageTicketCents: raw.orders === 0 ? 0 : Math.round(raw.totalCents / raw.orders),
+    freeDeliveryShare: raw.orders === 0 ? 0 : raw.freeDeliveryOrders / raw.orders,
+  };
+}
+
+// Sales figures for the admin dashboard. week = the last 7 Cuba days (today included), month = the
+// last 30, year = the last 12 calendar months; "previous" is the equal-length stretch before.
+async function getSalesStats(tenantId: string, range: StatsRange, now: Date = new Date()): Promise<SalesStats> {
+  const today = havanaToday(now);
+  const granularity = range === 'year' ? 'month' : 'day';
+
+  let from: string;
+  let previousFrom: string;
+  let buckets: string[];
+  if (range === 'year') {
+    const thisMonth = today.slice(0, 7);
+    const first = shiftMonths(thisMonth, -11);
+    from = `${first}-01`;
+    previousFrom = `${shiftMonths(first, -12)}-01`;
+    buckets = Array.from({ length: 12 }, (_, i) => shiftMonths(first, i));
+  } else {
+    const days = range === 'week' ? 7 : 30;
+    const first = shiftDays(today, -(days - 1));
+    from = first;
+    previousFrom = shiftDays(first, -days);
+    buckets = Array.from({ length: days }, (_, i) => shiftDays(first, i));
+  }
+
+  const data = await withTenant(tenantId, async (tx) => ({
+    current: await ordersRepo.salesTotals(tx, from, null),
+    previous: await ordersRepo.salesTotals(tx, previousFrom, from),
+    series: await ordersRepo.salesByBucket(tx, from, null, granularity),
+    byMunicipality: await ordersRepo.salesByMunicipality(tx, from, null),
+    topProducts: await ordersRepo.topProducts(tx, from, null, 5),
+  }));
+
+  const byBucket = new Map(data.series.map((row) => [row.bucket, row]));
+  return {
+    range,
+    currency: 'USD',
+    granularity,
+    current: toPeriodTotals(data.current),
+    previous: toPeriodTotals(data.previous),
+    series: buckets.map((bucket) => ({ bucket, totalCents: byBucket.get(bucket)?.totalCents ?? 0, orders: byBucket.get(bucket)?.orders ?? 0 })),
+    byMunicipality: data.byMunicipality,
+    topProducts: data.topProducts,
+  };
 }
 
 // Full refund only for M3 — the amount is always the order's own total.
@@ -775,7 +1067,8 @@ async function refund(tenantId: string, actorUserId: string, orderId: string, no
 // ordersService here), which is exactly the cross-module cycle CLAUDE.md
 // section 4 says to avoid with the event bus instead of a direct call.
 async function handlePaymentConfirmed(tenantId: string, orderId: string): Promise<void> {
-  await withTenant(tenantId, (tx) => transition(tx, tenantId, orderId, 'paid', undefined, 'Confirmed by payment provider'));
+  const { changed } = await withTenant(tenantId, (tx) => transitionTracked(tx, tenantId, orderId, 'paid', undefined, 'Confirmed by payment provider'));
+  if (changed) await announceStatus(tenantId, orderId, 'paid');
 }
 
 async function handlePaymentRefunded(tenantId: string, orderId: string): Promise<void> {
@@ -860,10 +1153,15 @@ export const ordersService = {
   getOrderForAdmin,
   listOrdersForAdmin,
   retryPayment,
+  getPaymentInstructions,
+  reportTransfer,
   cancelByBuyer,
   adminCancel,
   adminMarkPaid,
   adminMarkPreparing,
+  adminMarkOutForDelivery,
+  adminMarkDelivered,
+  getSalesStats,
   refund,
   handlePaymentConfirmed,
   handlePaymentRefunded,

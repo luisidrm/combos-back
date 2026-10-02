@@ -1,4 +1,6 @@
 import { Router } from 'express';
+import type { NextFunction, Request, Response } from 'express';
+import { ForbiddenError } from '../../core/errors.js';
 import { requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
 import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
 import { validate } from '../../core/middleware/validate.middleware.js';
@@ -48,8 +50,23 @@ catalogRouter.get('/products/:slug', resolveTenant, validate({ params: slugParam
 // --- admin ----------------------------------------------------------------
 
 const adminOnly = [resolveTenant, requireAuth, requireRole('admin')];
+// The packer (staff) may look at the product list and flip availability, nothing else.
+const staffOrAdmin = [resolveTenant, requireAuth, requireRole('admin', 'staff')];
 
-catalogRouter.get('/admin/categories', ...adminOnly, async (req, res, next) => {
+// Staff can change a product's stock status and nothing else — not its price, name, category or
+// limits. Checked on the validated body, so no field can slip past by being added later.
+export function staffMayOnlyChangeStock(req: Request, _res: Response, next: NextFunction): void {
+  if (req.authUser?.role === 'staff') {
+    const forbidden = Object.keys(req.body as Record<string, unknown>).filter((key) => key !== 'stockStatus');
+    if (forbidden.length > 0) {
+      next(new ForbiddenError('Staff can only change the stock status of a product', { reason: 'STAFF_FIELDS', fields: forbidden }));
+      return;
+    }
+  }
+  next();
+}
+
+catalogRouter.get('/admin/categories', ...staffOrAdmin, async (req, res, next) => {
   try {
     res.json(await catalogService.listCategoriesForAdmin(req.tenantId));
   } catch (err) {
@@ -97,7 +114,7 @@ catalogRouter.delete('/categories/:id', ...adminOnly, validate({ params: idParam
   }
 });
 
-catalogRouter.get('/admin/products', ...adminOnly, validate({ query: adminProductsQuerySchema }), async (req, res, next) => {
+catalogRouter.get('/admin/products', ...staffOrAdmin, validate({ query: adminProductsQuerySchema }), async (req, res, next) => {
   try {
     const { categoryId, active } = req.query as { categoryId?: string; active?: boolean };
     res.json(await catalogService.listProductsForAdmin(req.tenantId, { categoryId, active }));
@@ -106,7 +123,7 @@ catalogRouter.get('/admin/products', ...adminOnly, validate({ query: adminProduc
   }
 });
 
-catalogRouter.get('/admin/products/:id', ...adminOnly, validate({ params: idParamSchema }), async (req, res, next) => {
+catalogRouter.get('/admin/products/:id', ...staffOrAdmin, validate({ params: idParamSchema }), async (req, res, next) => {
   try {
     res.json(await catalogService.getProductForAdmin(req.tenantId, requireParam(req, 'id')));
   } catch (err) {
@@ -133,8 +150,9 @@ catalogRouter.put('/products/order', ...adminOnly, validate({ body: reorderSchem
 
 catalogRouter.patch(
   '/products/:id',
-  ...adminOnly,
+  ...staffOrAdmin,
   validate({ params: idParamSchema, body: updateProductSchema }),
+  staffMayOnlyChangeStock,
   async (req, res, next) => {
     try {
       res.json(await catalogService.updateProduct(req.tenantId, requireParam(req, 'id'), req.body));
@@ -144,7 +162,7 @@ catalogRouter.patch(
   },
 );
 
-catalogRouter.post('/products/:id/activate', ...adminOnly, validate({ params: idParamSchema }), async (req, res, next) => {
+catalogRouter.post('/products/:id/activate', ...staffOrAdmin, validate({ params: idParamSchema }), async (req, res, next) => {
   try {
     res.json(await catalogService.activateProduct(req.tenantId, requireParam(req, 'id')));
   } catch (err) {
@@ -152,7 +170,7 @@ catalogRouter.post('/products/:id/activate', ...adminOnly, validate({ params: id
   }
 });
 
-catalogRouter.post('/products/:id/deactivate', ...adminOnly, validate({ params: idParamSchema }), async (req, res, next) => {
+catalogRouter.post('/products/:id/deactivate', ...staffOrAdmin, validate({ params: idParamSchema }), async (req, res, next) => {
   try {
     res.json(await catalogService.deactivateProduct(req.tenantId, requireParam(req, 'id')));
   } catch (err) {

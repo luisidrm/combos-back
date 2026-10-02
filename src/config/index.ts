@@ -46,6 +46,17 @@ export const config = {
 
   resendApiKey: env.RESEND_API_KEY,
   emailFrom: env.EMAIL_FROM,
+  sendEmails: env.SEND_EMAILS ? env.SEND_EMAILS === 'true' : env.NODE_ENV === 'production',
+
+  // Manual transfer accounts (Zelle / Cash App / PayPal). Per-store settings arrive with M7.
+  manualPayments: {
+    payeeName: env.MANUAL_PAYEE_NAME,
+    zelleEmail: env.ZELLE_EMAIL,
+    cashappEmail: env.CASHAPP_EMAIL,
+    cashappCashtag: env.CASHAPP_CASHTAG?.replace(/^\$/, ''),
+    paypalEmail: env.PAYPAL_EMAIL,
+    paypalMeHandle: env.PAYPAL_ME_HANDLE?.replace(/^.*paypal\.me\//i, '').replace(/^@/, ''),
+  },
 
   tropipay: {
     clientId: env.TROPIPAY_CLIENT_ID,
