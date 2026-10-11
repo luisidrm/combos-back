@@ -1,0 +1,2 @@
+ALTER TABLE "orders" ADD COLUMN "share_token" varchar(64);--> statement-breakpoint
+CREATE UNIQUE INDEX "orders_share_token_unique" ON "orders" USING btree ("share_token") WHERE "orders"."share_token" is not null;

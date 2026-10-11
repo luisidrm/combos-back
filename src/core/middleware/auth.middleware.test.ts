@@ -27,6 +27,7 @@ function user(overrides: Partial<User> & Pick<User, 'supertokensUserId'>): User 
     role: 'buyer',
     fullName: null,
     phone: null,
+    locale: 'es',
     createdAt: new Date(),
     updatedAt: new Date(),
     deletedAt: null,

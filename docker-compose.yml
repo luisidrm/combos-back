@@ -38,9 +38,13 @@ services:
     environment:
       MINIO_ROOT_USER: combo_shop
       MINIO_ROOT_PASSWORD: combo_shop_secret
+    # High ports on purpose. On Windows, Hyper-V / WinNAT reserve blocks of ports that change between
+    # restarts (`netsh interface ipv4 show excludedportrange protocol=tcp`), and at one point they covered
+    # 8765-9064 and 9080-9279, which made Docker refuse to publish 9010 and left MinIO unreachable
+    # ("ports are not available ... access to a socket not permitted").
     ports:
-      - '9010:9000'
-      - '9011:9001'
+      - '19010:9000'
+      - '19011:9001'
     volumes:
       - minio_data:/data
 

@@ -1,18 +1,21 @@
 import { Router } from 'express';
-import { requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
+import { optionalAuth, requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
 import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
 import { requireVerifiedEmail } from '../../core/middleware/verified-email.middleware.js';
 import { validate } from '../../core/middleware/validate.middleware.js';
+import type { PageQuery } from '../../core/pagination.js';
 import { currentUser, requireParam } from '../../core/request.js';
 import {
   addressParamSchema,
   adminOrdersQuerySchema,
+  buyerOrdersQuerySchema,
   checkoutSchema,
   createAddressSchema,
   createRecipientSchema,
   orderIdParamSchema,
   quoteSchema,
   recipientParamSchema,
+  shareTokenParamSchema,
   statsQuerySchema,
   transferReportSchema,
   transitionNoteSchema,
@@ -57,10 +60,12 @@ ordersRouter.post('/checkout', ...verifiedBuyer, validate({ body: checkoutSchema
   }
 });
 
-ordersRouter.get('/', ...signedInBuyer, async (req, res, next) => {
+// The buyer's own orders, newest first, one page at a time (?cursor=&limit=).
+ordersRouter.get('/', ...signedInBuyer, validate({ query: buyerOrdersQuerySchema }), async (req, res, next) => {
   try {
     const user = await currentUser(req);
-    res.json(await ordersService.listOrdersForBuyer(req.tenantId, user.id));
+    const { scope, cursor, limit } = req.query as unknown as { scope?: 'active' | 'past' } & PageQuery;
+    res.json(await ordersService.pageOrdersForBuyer(req.tenantId, user.id, { cursor, limit }, scope));
   } catch (err) {
     next(err);
   }
@@ -91,6 +96,35 @@ ordersRouter.post(
     }
   },
 );
+
+// Sharing the products of an order by link (the buyer's own order only; 404 for anyone else's).
+ordersRouter.get('/:id/share', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    res.json(await ordersService.getShare(req.tenantId, user.id, requireParam(req, 'id')));
+  } catch (err) {
+    next(err);
+  }
+});
+
+ordersRouter.post('/:id/share', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    res.json(await ordersService.enableShare(req.tenantId, user.id, requireParam(req, 'id')));
+  } catch (err) {
+    next(err);
+  }
+});
+
+ordersRouter.delete('/:id/share', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
+  try {
+    const user = await currentUser(req);
+    await ordersService.disableShare(req.tenantId, user.id, requireParam(req, 'id'));
+    res.status(204).end();
+  } catch (err) {
+    next(err);
+  }
+});
 
 ordersRouter.get('/:id', ...signedInBuyer, validate({ params: orderIdParamSchema }), async (req, res, next) => {
   try {
@@ -134,9 +168,21 @@ ordersRouter.post(
 
 // --- admin ------------------------------------------------------------------
 
+// The queue, newest first, one page at a time. Filters and search run on the server: `?status=`, `?filter=transfer`,
+// `?q=` (order number, recipient, buyer), `?cursor=&limit=`. Declared before /admin/:id so these names are never read as ids.
 ordersRouter.get('/admin/list', ...staffOrAdmin, validate({ query: adminOrdersQuerySchema }), async (req, res, next) => {
   try {
-    res.json(await ordersService.listOrdersForAdmin(req.tenantId, req.query as { status?: OrderStatus }));
+    const { status, filter, q, cursor, limit } = req.query as unknown as { status?: OrderStatus; filter?: 'transfer'; q?: string } & PageQuery;
+    res.json(await ordersService.pageOrdersForAdmin(req.tenantId, { status, filter, q }, { cursor, limit }));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// How many orders each status has (and how many transfers wait to be checked): the numbers on the queue's chips.
+ordersRouter.get('/admin/counts', ...staffOrAdmin, async (req, res, next) => {
+  try {
+    res.json(await ordersService.adminOrderCounts(req.tenantId));
   } catch (err) {
     next(err);
   }
@@ -254,6 +300,20 @@ ordersRouter.post(
 // section 4) but is mounted at /recipients, which reads better than
 // /orders/recipients. Signed-in buyers only — each sees just their own.
 export const recipientsRouter = Router();
+
+// --- the public side of a share link (mounted at /shared) ---------------------------------------------------------
+//
+// Open to anyone who holds the link, signed in or not (a session, if there is one, only decides whether the visitor
+// is store staff, who also learn which order it is so the web app can send them to it in the admin).
+export const sharedRouter = Router();
+
+sharedRouter.get('/:token', resolveTenant, optionalAuth, validate({ params: shareTokenParamSchema }), async (req, res, next) => {
+  try {
+    res.json(await ordersService.getSharedOrder(req.tenantId, requireParam(req, 'token'), req.authUser?.role));
+  } catch (err) {
+    next(err);
+  }
+});
 
 const signedIn = [resolveTenant, requireAuth];
 

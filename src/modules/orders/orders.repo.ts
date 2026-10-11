@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNull, lt, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, getTableColumns, gte, ilike, inArray, isNull, lt, notInArray, or, sql, type SQL } from 'drizzle-orm';
 import type { Transaction } from '../../db/client.js';
 import {
   addresses,
@@ -170,6 +170,26 @@ export async function insertOrder(tx: Transaction, values: NewOrder): Promise<Or
   return row;
 }
 
+export async function setShareToken(tx: Transaction, id: string, token: string | null): Promise<Order | undefined> {
+  const [row] = await tx.update(orders).set({ shareToken: token, updatedAt: new Date() }).where(eq(orders.id, id)).returning();
+  return row;
+}
+
+export async function findByShareToken(tx: Transaction, token: string): Promise<Order | undefined> {
+  const [row] = await tx.select().from(orders).where(eq(orders.shareToken, token)).limit(1);
+  return row;
+}
+
+// The order a checkout attempt already made, if any (see orders.checkout_key).
+export async function findByCheckoutKey(tx: Transaction, buyerUserId: string, key: string): Promise<Order | undefined> {
+  const [row] = await tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.buyerUserId, buyerUserId), eq(orders.checkoutKey, key)))
+    .limit(1);
+  return row;
+}
+
 export async function insertOrderItems(tx: Transaction, values: NewOrderItem[]): Promise<OrderItem[]> {
   if (values.length === 0) {
     return [];
@@ -191,16 +211,92 @@ export async function findForBuyer(tx: Transaction, buyerUserId: string, id: str
   return row;
 }
 
-export async function listForBuyer(tx: Transaction, buyerUserId: string): Promise<Order[]> {
-  return tx.select().from(orders).where(eq(orders.buyerUserId, buyerUserId)).orderBy(desc(orders.createdAt));
+// --- paged lists ------------------------------------------------------------------------------------------
+//
+// Newest first, in pages. The position inside the list is (created_at, id); created_at keeps its microseconds
+// (`cursorAt`, text), because a JavaScript Date only has milliseconds and two orders placed in the same millisecond
+// would otherwise be skipped or repeated at a page boundary.
+
+export type OrderRow = Order & { cursorAt: string };
+export interface OrderPage {
+  /** Fetch this many rows (the caller asks for one more than it shows, to learn whether a next page exists). */
+  limit: number;
+  /** The [cursorAt, id] of the last row already shown. */
+  after?: [string, string];
 }
 
-export async function listForAdmin(tx: Transaction, filter: { status?: string } = {}): Promise<Order[]> {
+const cursorAt = sql<string>`to_char(${orders.createdAt} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
+const pageColumns = { ...getTableColumns(orders), cursorAt };
+
+const afterCondition = (after: OrderPage['after']) =>
+  after ? sql`(${orders.createdAt}, ${orders.id}) < (${after[0]}::timestamptz, ${after[1]}::uuid)` : undefined;
+
+const likePattern = (text: string) => `%${text.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
+
+export async function pageForBuyer(tx: Transaction, buyerUserId: string, page: OrderPage, statuses?: { in?: string[]; notIn?: string[] }): Promise<OrderRow[]> {
   return tx
-    .select()
+    .select(pageColumns)
     .from(orders)
-    .where(filter.status ? eq(orders.status, filter.status) : undefined)
-    .orderBy(desc(orders.createdAt));
+    .where(
+      and(
+        eq(orders.buyerUserId, buyerUserId),
+        statuses?.in ? inArray(orders.status, statuses.in) : undefined,
+        statuses?.notIn ? notInArray(orders.status, statuses.notIn) : undefined,
+        afterCondition(page.after),
+      ),
+    )
+    .orderBy(desc(orders.createdAt), desc(orders.id))
+    .limit(page.limit);
+}
+
+export interface AdminOrderFilter {
+  status?: string;
+  /** Any of these statuses (the dispatch board looks at orders that are paid, preparing or out for delivery). */
+  statuses?: string[];
+  /** Only these orders (the ones with a transfer report waiting, or the ones a courier is assigned to). */
+  onlyIds?: string[];
+  /** Everything except these (the orders that already have a courier). */
+  excludeIds?: string[];
+  /** A search: the order number or the recipient's name contains the text, or the buyer is one of `buyerIds`. */
+  search?: { text: string; buyerIds: string[] };
+}
+
+export async function pageForAdmin(tx: Transaction, filter: AdminOrderFilter, page: OrderPage): Promise<OrderRow[]> {
+  const conditions = [afterCondition(page.after)];
+  if (filter.status) conditions.push(eq(orders.status, filter.status));
+  if (filter.statuses) conditions.push(inArray(orders.status, filter.statuses));
+  if (filter.excludeIds && filter.excludeIds.length > 0) conditions.push(notInArray(orders.id, filter.excludeIds));
+  if (filter.onlyIds) conditions.push(filter.onlyIds.length > 0 ? inArray(orders.id, filter.onlyIds) : sql`false`);
+  if (filter.search) {
+    const pattern = likePattern(filter.search.text);
+    conditions.push(
+      or(
+        ilike(orders.orderNumber, pattern),
+        ilike(orders.recipientNameSnapshot, pattern),
+        filter.search.buyerIds.length > 0 ? inArray(orders.buyerUserId, filter.search.buyerIds) : undefined,
+      ),
+    );
+  }
+  return tx
+    .select(pageColumns)
+    .from(orders)
+    .where(and(...conditions))
+    .orderBy(desc(orders.createdAt), desc(orders.id))
+    .limit(page.limit);
+}
+
+// How many orders each status has, for the filter chips: counted by the database, not by whatever the screen has loaded.
+export async function countByStatus(tx: Transaction): Promise<Array<{ status: string; n: number }>> {
+  return tx.select({ status: orders.status, n: sql<number>`count(*)::int` }).from(orders).groupBy(orders.status);
+}
+
+export async function countPendingAmong(tx: Transaction, ids: string[]): Promise<number> {
+  if (ids.length === 0) return 0;
+  const [row] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(orders)
+    .where(and(inArray(orders.id, ids), eq(orders.status, 'pending_payment')));
+  return row?.n ?? 0;
 }
 
 export async function listItems(tx: Transaction, orderId: string): Promise<OrderItem[]> {
@@ -338,6 +434,17 @@ export async function updateStatus(tx: Transaction, id: string, values: StatusUp
     .where(eq(orders.id, id))
     .returning();
   return row;
+}
+
+// Claims the right to send the "still waiting for your payment" reminder: true for exactly one caller, once, and only
+// while the order is still unpaid. A repeated run of the maintenance pass finds it already claimed.
+export async function claimPaymentReminder(tx: Transaction, id: string, now: Date): Promise<boolean> {
+  const rows = await tx
+    .update(orders)
+    .set({ paymentReminderSentAt: now })
+    .where(and(eq(orders.id, id), eq(orders.status, 'pending_payment'), isNull(orders.paymentReminderSentAt)))
+    .returning({ id: orders.id });
+  return rows.length > 0;
 }
 
 // Reconciliation: orders whose payment was never confirmed, old enough to

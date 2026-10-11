@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.git
+.gitignore
+.github
+.claude
+# Real environment files hold secrets; the image gets them at run time, never at build time.
+.env
+.env.*
+!.env.example
+docs
+deploy
+*.log

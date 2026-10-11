@@ -1,0 +1,8 @@
+{
+  // What goes into the production image: the app and the seeds a first deploy needs, never the tests, the test
+  // helpers, or the demo-data seed (which creates accounts with a known password and must not exist in production).
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "sourceMap": false },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts", "src/db/testing/**", "src/db/seed/demo.seed.ts"]
+}

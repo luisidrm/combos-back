@@ -1,0 +1,4 @@
+# Shell scripts run on Linux servers and inside containers: always LF line endings.
+*.sh text eol=lf
+deploy/Caddyfile text eol=lf
+Dockerfile text eol=lf

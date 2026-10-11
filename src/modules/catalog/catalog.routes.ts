@@ -4,6 +4,7 @@ import { ForbiddenError } from '../../core/errors.js';
 import { requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
 import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
 import { validate } from '../../core/middleware/validate.middleware.js';
+import type { PageQuery } from '../../core/pagination.js';
 import { requireParam } from '../../core/request.js';
 import {
   adminProductsQuerySchema,
@@ -32,8 +33,8 @@ catalogRouter.get('/categories', resolveTenant, async (req, res, next) => {
 
 catalogRouter.get('/products', resolveTenant, validate({ query: publicProductsQuerySchema }), async (req, res, next) => {
   try {
-    const { categoryId } = req.query as { categoryId?: string };
-    res.json(await catalogService.listPublicProducts(req.tenantId, { categoryId }));
+    const { categoryId, q, cursor, limit } = req.query as unknown as { categoryId?: string; q?: string } & PageQuery;
+    res.json(await catalogService.pagePublicProducts(req.tenantId, { categoryId, q }, { cursor, limit }));
   } catch (err) {
     next(err);
   }
@@ -114,10 +115,19 @@ catalogRouter.delete('/categories/:id', ...adminOnly, validate({ params: idParam
   }
 });
 
+// Declared before /admin/products/:id so "summary" is never read as an id.
+catalogRouter.get('/admin/products-summary', ...staffOrAdmin, async (req, res, next) => {
+  try {
+    res.json(await catalogService.summarizeProductsForAdmin(req.tenantId));
+  } catch (err) {
+    next(err);
+  }
+});
+
 catalogRouter.get('/admin/products', ...staffOrAdmin, validate({ query: adminProductsQuerySchema }), async (req, res, next) => {
   try {
-    const { categoryId, active } = req.query as { categoryId?: string; active?: boolean };
-    res.json(await catalogService.listProductsForAdmin(req.tenantId, { categoryId, active }));
+    const { categoryId, active, q, cursor, limit } = req.query as unknown as { categoryId?: string; active?: boolean; q?: string } & PageQuery;
+    res.json(await catalogService.pageProductsForAdmin(req.tenantId, { categoryId, active, q }, { cursor, limit }));
   } catch (err) {
     next(err);
   }

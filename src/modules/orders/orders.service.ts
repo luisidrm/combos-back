@@ -1,9 +1,13 @@
+import { randomBytes, randomUUID } from 'node:crypto';
 import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { events } from '../../core/events.js';
 import { logger } from '../../core/logger.js';
 import { withTenant, type Transaction } from '../../db/client.js';
+import { collectAll, decodeCursor, toPage, type Page, type PageQuery } from '../../core/pagination.js';
+import { isUniqueViolation } from '../../db/errors.js';
 import { config } from '../../config/index.js';
 import { auditService } from '../audit/index.js';
+import { catalogService } from '../catalog/index.js';
 import { cartService, type CartLineView, type CartView } from '../cart/index.js';
 import { geoService, type DeliveryZoneView } from '../geo/index.js';
 import { identityService } from '../identity/index.js';
@@ -392,6 +396,10 @@ export interface OrderItemView {
 export interface BuyerSummary {
   fullName: string | null;
   email: string;
+  /** So the store can message the buyer on WhatsApp. */
+  phone: string | null;
+  /** The language their emails are written in. */
+  locale: 'es' | 'en';
 }
 export interface AdminOrderListItem extends OrderView {
   buyer: BuyerSummary | null;
@@ -403,6 +411,8 @@ export interface AdminOrderListItem extends OrderView {
 // What an admin sees on one order beyond the buyer's own view: who bought, how it is being paid, and
 // what the buyer reported for a manual transfer (the screenshots are read through /media/manage).
 export type AdminOrderDetail = OrderDetailView & {
+  /** The buyer's user id (for the notifications module to reach them). */
+  buyerUserId: string;
   buyer: BuyerSummary | null;
   paymentProvider: string | null;
   paymentReport: TransferReport | null;
@@ -505,92 +515,119 @@ async function checkout(
   buyerUserId: string,
   input: CheckoutInput,
 ): Promise<{ order: OrderDetailView; checkoutUrl: string | null }> {
+  // The same attempt sent twice (a double click, a retry after a dropped connection) gets the order it already made.
+  // Checked before pricing, because by then the first attempt has emptied the cart and pricing would refuse.
+  const replay = async (): Promise<{ order: OrderDetailView; checkoutUrl: string | null } | null> => {
+    if (!input.idempotencyKey) return null;
+    const existing = await withTenant(tenantId, (tx) => ordersRepo.findByCheckoutKey(tx, buyerUserId, input.idempotencyKey as string));
+    if (!existing) return null;
+    // A payment link is not remade: the buyer is shown the order, where "pay" can be retried.
+    return { order: await getOrderForBuyer(tenantId, buyerUserId, existing.id), checkoutUrl: null };
+  };
+  const earlier = await replay();
+  if (earlier) return earlier;
+
   const priced = await quote(tenantId, buyerUserId, { recipientId: input.recipientId, addressId: input.addressId });
   if (!priced.canCheckout || !priced.delivery) {
     throw new ConflictError('This cart cannot be checked out yet', { reason: priced.blockers[0] ?? 'CART_HAS_ISSUES', blockers: priced.blockers });
   }
 
-  const { order, items, paymentId } = await withTenant(tenantId, async (tx) => {
-    // Re-checked here, not just by the quote() call above: a soft-deleted
-    // address still satisfies orders.address_id's FK (the row isn't gone,
-    // only flagged), so only an explicit check — not the database — catches
-    // a delete that lands in the gap between pricing and this transaction.
-    await requireRecipient(tx, buyerUserId, input.recipientId);
-    const address = await ordersRepo.findAddress(tx, input.recipientId, input.addressId);
-    if (!address) {
-      throw new NotFoundError(`No address with id "${input.addressId}"`);
-    }
-    const recipient = await requireRecipient(tx, buyerUserId, input.recipientId);
+  let created: { order: Order; items: OrderItem[]; paymentId: string };
+  try {
+    created = await withTenant(tenantId, async (tx) => {
+      // Re-checked here, not just by the quote() call above: a soft-deleted
+      // address still satisfies orders.address_id's FK (the row isn't gone,
+      // only flagged), so only an explicit check — not the database — catches
+      // a delete that lands in the gap between pricing and this transaction.
+      await requireRecipient(tx, buyerUserId, input.recipientId);
+      const address = await ordersRepo.findAddress(tx, input.recipientId, input.addressId);
+      if (!address) {
+        throw new NotFoundError(`No address with id "${input.addressId}"`);
+      }
+      const recipient = await requireRecipient(tx, buyerUserId, input.recipientId);
 
-    const orderNumber = await nextOrderNumber(tx, tenantId);
-    const insertedOrder = await ordersRepo.insertOrder(tx, {
-      tenantId,
-      orderNumber,
-      buyerUserId,
-      recipientId: recipient.id,
-      addressId: address.id,
-      recipientNameSnapshot: recipient.fullName,
-      recipientPhonesSnapshot: [recipient.phone1, recipient.phone2].filter(Boolean).join(', '),
-      addressSnapshot: toAddressView(address),
-      deliveryZoneId: priced.delivery?.id as string,
-      giftMessage: input.giftMessage,
-      buyerNotes: input.buyerNotes,
-      // The platform's base currency is USD end to end today (CLAUDE.md
-      // section 1/5) — no conversion happens, so the rate is the identity
-      // rate. currency_rates/rate_used exist in the schema for when a
-      // non-USD price list is introduced; nothing populates them yet.
-      currency: 'USD',
-      rateUsed: '1.000000',
-      subtotalCents: priced.subtotalCents,
-      deliveryFeeCents: priced.deliveryFeeCents,
-      totalCents: priced.totalCents,
-      status: 'pending_payment',
-      placedAt: new Date(),
-    });
+      const orderNumber = await nextOrderNumber(tx, tenantId);
+      const insertedOrder = await ordersRepo.insertOrder(tx, {
+        tenantId,
+        orderNumber,
+        buyerUserId,
+        recipientId: recipient.id,
+        addressId: address.id,
+        recipientNameSnapshot: recipient.fullName,
+        recipientPhonesSnapshot: [recipient.phone1, recipient.phone2].filter(Boolean).join(', '),
+        addressSnapshot: toAddressView(address),
+        deliveryZoneId: priced.delivery?.id as string,
+        giftMessage: input.giftMessage,
+        buyerNotes: input.buyerNotes,
+        // The platform's base currency is USD end to end today (CLAUDE.md
+        // section 1/5) — no conversion happens, so the rate is the identity
+        // rate. currency_rates/rate_used exist in the schema for when a
+        // non-USD price list is introduced; nothing populates them yet.
+        currency: 'USD',
+        rateUsed: '1.000000',
+        subtotalCents: priced.subtotalCents,
+        deliveryFeeCents: priced.deliveryFeeCents,
+        totalCents: priced.totalCents,
+        status: 'pending_payment',
+        placedAt: new Date(),
+        checkoutKey: input.idempotencyKey,
+      });
 
-    const itemValues: NewOrderItem[] = priced.cart.items.map((line) => {
-      const product = requireLineProduct(line);
-      return {
+      const itemValues: NewOrderItem[] = priced.cart.items.map((line) => {
+        const product = requireLineProduct(line);
+        return {
+          tenantId,
+          orderId: insertedOrder.id,
+          productId: line.productId,
+          productNameSnapshot: product.nameEs,
+          productNameEnSnapshot: product.nameEn,
+          productThumbUrlSnapshot: product.picture?.thumbUrl ?? null,
+          unitLabelSnapshot: product.unitLabel,
+          unitPriceCents: product.unitPriceCents,
+          quantity: line.quantity,
+          lineTotalCents: line.lineTotalCents,
+        };
+      });
+      const insertedItems = await ordersRepo.insertOrderItems(tx, itemValues);
+
+      await auditService.record(tx, {
+        tenantId,
+        actorUserId: buyerUserId,
+        entityType: 'order',
+        entityId: insertedOrder.id,
+        action: 'order.placed',
+      });
+
+      const payment = await paymentsService.createPendingPayment(tx, {
         tenantId,
         orderId: insertedOrder.id,
-        productId: line.productId,
-        productNameSnapshot: product.nameEs,
-        productNameEnSnapshot: product.nameEn,
-        productThumbUrlSnapshot: product.picture?.thumbUrl ?? null,
-        unitLabelSnapshot: product.unitLabel,
-        unitPriceCents: product.unitPriceCents,
-        quantity: line.quantity,
-        lineTotalCents: line.lineTotalCents,
-      };
-    });
-    const insertedItems = await ordersRepo.insertOrderItems(tx, itemValues);
+        provider: input.provider,
+        amountCents: insertedOrder.totalCents,
+        currency: insertedOrder.currency,
+      });
+      await auditService.record(tx, {
+        tenantId,
+        actorUserId: buyerUserId,
+        entityType: 'payment',
+        entityId: payment.id,
+        action: 'payment.created',
+        note: input.provider,
+      });
 
-    await auditService.record(tx, {
-      tenantId,
-      actorUserId: buyerUserId,
-      entityType: 'order',
-      entityId: insertedOrder.id,
-      action: 'order.placed',
+      return { order: insertedOrder, items: insertedItems, paymentId: payment.id };
     });
-
-    const payment = await paymentsService.createPendingPayment(tx, {
-      tenantId,
-      orderId: insertedOrder.id,
-      provider: input.provider,
-      amountCents: insertedOrder.totalCents,
-      currency: insertedOrder.currency,
-    });
-    await auditService.record(tx, {
-      tenantId,
-      actorUserId: buyerUserId,
-      entityType: 'payment',
-      entityId: payment.id,
-      action: 'payment.created',
-      note: input.provider,
-    });
-
-    return { order: insertedOrder, items: insertedItems, paymentId: payment.id };
-  });
+  } catch (err) {
+    // Two requests with the same key arrived together: both passed the check above, the unique index let one
+    // through. The loser returns what the winner made.
+    if (input.idempotencyKey && isUniqueViolation(err)) {
+      const winner = await replay();
+      if (winner) return winner;
+    }
+    throw err;
+  }
+  const { order, items, paymentId } = created;
+  // "We received your order": only for a checkout that really placed one (a replayed key returned above).
+  await announceStatus(tenantId, order.id, 'pending_payment');
 
   const checkoutUrl = await startProviderCheckout(tenantId, buyerUserId, order, input.provider, paymentId);
 
@@ -645,9 +682,38 @@ async function getOrderForBuyer(tenantId: string, buyerUserId: string, orderId: 
   });
 }
 
+// A cursor from the client says where the last page ended: [created_at (text, microseconds), order id]. Checked here
+// because both go straight into SQL casts, and a hand-edited cursor must be a 400, never a database error.
+const ISO_MICROS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function orderCursor(cursor: string | undefined): [string, string] | undefined {
+  if (!cursor) return undefined;
+  const [at, id] = decodeCursor(cursor, 2).map(String) as [string, string];
+  if (!ISO_MICROS.test(at) || !UUID.test(id)) {
+    throw new ValidationError('That page cursor is not valid', { reason: 'BAD_CURSOR' });
+  }
+  return [at, id];
+}
+const orderCursorOf = (row: ordersRepo.OrderRow): string[] => [row.cursorAt, row.id];
+
+// One page of a buyer's own orders, newest first.
+async function pageOrdersForBuyer(
+  tenantId: string,
+  buyerUserId: string,
+  page: PageQuery,
+  scope?: 'active' | 'past',
+): Promise<Page<OrderView>> {
+  const after = orderCursor(page.cursor);
+  const finished = ['delivered', 'cancelled', 'refunded'];
+  const statuses = scope === 'active' ? { notIn: finished } : scope === 'past' ? { in: finished } : undefined;
+  const rows = await withTenant(tenantId, (tx) => ordersRepo.pageForBuyer(tx, buyerUserId, { limit: page.limit + 1, after }, statuses));
+  const result = toPage(rows, page.limit, orderCursorOf);
+  return { items: result.items.map(toOrderView), nextCursor: result.nextCursor };
+}
+
+// Every order of a buyer (internal callers and tests; the API serves pages).
 async function listOrdersForBuyer(tenantId: string, buyerUserId: string): Promise<OrderView[]> {
-  const rows = await withTenant(tenantId, (tx) => ordersRepo.listForBuyer(tx, buyerUserId));
-  return rows.map(toOrderView);
+  return collectAll((cursor) => pageOrdersForBuyer(tenantId, buyerUserId, { limit: 100, cursor }));
 }
 
 async function getOrderForAdmin(tenantId: string, orderId: string): Promise<AdminOrderDetail> {
@@ -664,33 +730,79 @@ async function getOrderForAdmin(tenantId: string, orderId: string): Promise<Admi
   return {
     ...toOrderView(order),
     items: items.map(toOrderItemView),
+    buyerUserId: order.buyerUserId,
     buyer: buyers.get(order.buyerUserId) ?? null,
     paymentProvider: payment?.provider ?? null,
     paymentReport: reports.get(orderId) ?? null,
   };
 }
 
-async function listOrdersForAdmin(tenantId: string, filter: { status?: OrderStatus }): Promise<AdminOrderListItem[]> {
+interface AdminOrderQuery {
+  status?: OrderStatus;
+  /** Any of these statuses. */
+  statuses?: OrderStatus[];
+  /** Only these orders. */
+  onlyIds?: string[];
+  /** Everything except these orders. */
+  excludeIds?: string[];
+  /** "transfer": unpaid orders whose buyer reported a transfer (the ones to check). */
+  filter?: 'transfer';
+  /** Searches the order number, the recipient's name and the buyer's name or email. */
+  q?: string;
+}
+
+// How many orders each status has, for the queue's filter chips. Counted by the database: the screen only holds a page.
+async function adminOrderCounts(tenantId: string): Promise<{ all: number; byStatus: Record<string, number>; transfer: number }> {
+  const { rows, transfer } = await withTenant(tenantId, async (tx) => {
+    const reported = await paymentsService.listOrderIdsWithTransferReport(tx);
+    return { rows: await ordersRepo.countByStatus(tx), transfer: await ordersRepo.countPendingAmong(tx, reported) };
+  });
+  const byStatus = Object.fromEntries(rows.map((row) => [row.status, row.n]));
+  return { all: rows.reduce((sum, row) => sum + row.n, 0), byStatus, transfer };
+}
+
+// One page of the admin queue, newest first, with the buyer, the item count and whether a transfer is waiting.
+async function pageOrdersForAdmin(tenantId: string, query: AdminOrderQuery, page: PageQuery): Promise<Page<AdminOrderListItem>> {
+  const after = orderCursor(page.cursor);
+  const buyerIds = query.q ? await identityService.findUserIdsMatching(tenantId, query.q) : [];
+
   const { rows, items, reports } = await withTenant(tenantId, async (tx) => {
-    const found = await ordersRepo.listForAdmin(tx, filter);
-    const ids = found.map((order) => order.id);
+    const filter: ordersRepo.AdminOrderFilter = { status: query.status, statuses: query.statuses, onlyIds: query.onlyIds, excludeIds: query.excludeIds };
+    if (query.filter === 'transfer') {
+      filter.status = 'pending_payment';
+      const reported = await paymentsService.listOrderIdsWithTransferReport(tx);
+      filter.onlyIds = query.onlyIds ? reported.filter((id) => query.onlyIds?.includes(id)) : reported;
+    }
+    if (query.q) filter.search = { text: query.q, buyerIds };
+    const found = await ordersRepo.pageForAdmin(tx, filter, { limit: page.limit + 1, after });
+    const shown = found.slice(0, page.limit);
+    const ids = shown.map((order) => order.id);
     return {
       rows: found,
       items: await ordersRepo.listItemsForOrders(tx, ids),
       reports: await paymentsService.getLatestTransferReports(tx, ids),
     };
   });
-  const buyers = await identityService.getSummaries(tenantId, rows.map((order) => order.buyerUserId));
+  const result = toPage(rows, page.limit, orderCursorOf);
+  const buyers = await identityService.getSummaries(tenantId, result.items.map((order) => order.buyerUserId));
   const counts = new Map<string, number>();
   for (const item of items) {
     counts.set(item.orderId, (counts.get(item.orderId) ?? 0) + item.quantity);
   }
-  return rows.map((order) => ({
-    ...toOrderView(order),
-    buyer: buyers.get(order.buyerUserId) ?? null,
-    itemCount: counts.get(order.id) ?? 0,
-    transferReported: order.status === 'pending_payment' && reports.has(order.id),
-  }));
+  return {
+    items: result.items.map((order) => ({
+      ...toOrderView(order),
+      buyer: buyers.get(order.buyerUserId) ?? null,
+      itemCount: counts.get(order.id) ?? 0,
+      transferReported: order.status === 'pending_payment' && reports.has(order.id),
+    })),
+    nextCursor: result.nextCursor,
+  };
+}
+
+// Every order, optionally of one status (internal callers and tests; the API serves pages).
+async function listOrdersForAdmin(tenantId: string, filter: { status?: OrderStatus }): Promise<AdminOrderListItem[]> {
+  return collectAll((cursor) => pageOrdersForAdmin(tenantId, filter, { limit: 100, cursor }));
 }
 
 // --- manual transfer (Zelle / Cash App / PayPal) -------------------------------
@@ -717,7 +829,7 @@ async function getPaymentInstructions(tenantId: string, buyerUserId: string, ord
     amountCents: order.totalCents,
     currency: order.currency,
     reference: order.orderNumber,
-    methods: paymentsService.listManualMethods(order.totalCents),
+    methods: await paymentsService.listManualMethods(tenantId, order.totalCents),
     report: reports.get(orderId) ?? null,
   };
 }
@@ -726,16 +838,16 @@ async function reportTransfer(
   tenantId: string,
   buyerUserId: string,
   orderId: string,
-  input: { method: string; transferReference: string; notes?: string | null },
+  input: { methodId: string; transferReference: string; notes?: string | null },
 ): Promise<PaymentInstructions> {
   const order = await withTenant(tenantId, (tx) => requireOrderForBuyer(tx, buyerUserId, orderId));
   if (order.status !== 'pending_payment') {
     throw new ConflictError('Only an order still waiting for payment can have a transfer reported', { reason: 'NOT_PENDING_PAYMENT' });
   }
-  const methods = paymentsService.listManualMethods(order.totalCents);
-  const method = methods.find((m) => m.method === input.method);
+  const methods = await paymentsService.listManualMethods(tenantId, order.totalCents);
+  const method = methods.find((m) => m.id === input.methodId);
   if (!method) {
-    throw new ValidationError(`"${input.method}" is not a payment method this store accepts`);
+    throw new ValidationError('That is not a payment method this store accepts', { reason: 'UNKNOWN_PAYMENT_METHOD' });
   }
   // The admin decides from the screenshot, so one has to exist (a failed upload does not count).
   const shots = await mediaService.listForManagement(tenantId, 'payment_proof', orderId);
@@ -751,7 +863,8 @@ async function reportTransfer(
     await paymentsService.recordTransferReport(tx, {
       tenantId,
       paymentId: payment.id,
-      method: method.method,
+      methodId: method.id,
+      label: method.label,
       transferReference: input.transferReference,
       notes: input.notes,
     });
@@ -764,6 +877,13 @@ async function reportTransfer(
       note: method.label,
     });
   });
+  // Tell the store there is a transfer to check (an email). After the report is saved, never inside it, and
+  // a failure to announce does not undo the report.
+  try {
+    await events.emit('order.transfer_reported', { orderId, tenantId, eventId: randomUUID() });
+  } catch (err) {
+    logger.warn({ err, orderId }, 'Could not announce a reported transfer');
+  }
   const result = await getPaymentInstructions(tenantId, buyerUserId, orderId);
   if (!result) throw new ConflictError('This order is not paid by manual transfer', { reason: 'NOT_MANUAL_PAYMENT' });
   return result;
@@ -866,9 +986,10 @@ async function transitionTracked(
 // Tells the rest of the system an order moved, for emails and the like. Called after the
 // transaction has committed, never inside it, and never fails the request: a lost notification is
 // worse than nothing only if the status change itself is lost, and that has already been saved.
-async function announceStatus(tenantId: string, orderId: string, status: OrderStatus): Promise<void> {
+async function announceStatus(tenantId: string, orderId: string, status: OrderStatus, cause?: 'unpaid'): Promise<void> {
   try {
-    await events.emit('order.status_changed', { orderId, tenantId, status });
+    const eventId = randomUUID();
+    await events.emit('order.status_changed', cause ? { orderId, tenantId, status, cause, eventId } : { orderId, tenantId, status, eventId });
   } catch (err) {
     logger.warn({ err, orderId }, 'Could not announce an order status change');
   }
@@ -878,14 +999,18 @@ async function announceStatus(tenantId: string, orderId: string, status: OrderSt
 // that has already changed hands is a refund, not a cancel (see the
 // transition table above), and refunds are an admin action.
 async function cancelByBuyer(tenantId: string, buyerUserId: string, orderId: string, note?: string): Promise<OrderView> {
-  return withTenant(tenantId, async (tx) => {
+  const { order, changed } = await withTenant(tenantId, async (tx) => {
     await requireOrderForBuyer(tx, buyerUserId, orderId);
-    return toOrderView(await transition(tx, tenantId, orderId, 'cancelled', buyerUserId, note));
+    return transitionTracked(tx, tenantId, orderId, 'cancelled', buyerUserId, note);
   });
+  if (changed) await announceStatus(tenantId, orderId, 'cancelled');
+  return toOrderView(order);
 }
 
 async function adminCancel(tenantId: string, actorUserId: string, orderId: string, note?: string): Promise<OrderView> {
-  return withTenant(tenantId, async (tx) => toOrderView(await transition(tx, tenantId, orderId, 'cancelled', actorUserId, note)));
+  const { order, changed } = await withTenant(tenantId, (tx) => transitionTracked(tx, tenantId, orderId, 'cancelled', actorUserId, note));
+  if (changed) await announceStatus(tenantId, orderId, 'cancelled');
+  return toOrderView(order);
 }
 
 // An operator's manual override for "I can see in my own banking/TropiPay
@@ -1051,10 +1176,93 @@ async function refund(tenantId: string, actorUserId: string, orderId: string, no
     throw new ConflictError('The payment provider refused the refund');
   }
 
-  return withTenant(tenantId, async (tx) => {
+  const { order: refunded, changed } = await withTenant(tenantId, async (tx) => {
     await paymentsService.markStatus(tx, payment.id, 'refunded');
-    return toOrderView(await transition(tx, tenantId, orderId, 'refunded', actorUserId, note));
+    return transitionTracked(tx, tenantId, orderId, 'refunded', actorUserId, note);
   });
+  if (changed) await announceStatus(tenantId, orderId, 'refunded');
+  return toOrderView(refunded);
+}
+
+// --- sharing an order's products by link --------------------------------------------------------------------
+//
+// After placing an order the buyer can share a link: whoever opens it sees the LIST OF PRODUCTS (names, units,
+// quantities, what is available now) and can put them in their own cart. It never carries the recipient, address,
+// phones, photos or what was paid — the token is a capability, so it must show nothing worth stealing. The buyer
+// can switch it off; the old link then answers 404 like any other unknown one.
+
+async function getShare(tenantId: string, buyerUserId: string, orderId: string): Promise<{ token: string | null }> {
+  const order = await withTenant(tenantId, (tx) => requireOrderForBuyer(tx, buyerUserId, orderId));
+  return { token: order.shareToken };
+}
+
+// Idempotent: sharing again returns the same link.
+async function enableShare(tenantId: string, buyerUserId: string, orderId: string): Promise<{ token: string }> {
+  return withTenant(tenantId, async (tx) => {
+    const order = await requireOrderForBuyer(tx, buyerUserId, orderId);
+    if (order.shareToken) return { token: order.shareToken };
+    const token = randomBytes(32).toString('base64url');
+    await ordersRepo.setShareToken(tx, orderId, token);
+    await auditService.record(tx, { tenantId, actorUserId: buyerUserId, entityType: 'order', entityId: orderId, action: 'order.share_enabled' });
+    return { token };
+  });
+}
+
+async function disableShare(tenantId: string, buyerUserId: string, orderId: string): Promise<void> {
+  await withTenant(tenantId, async (tx) => {
+    const order = await requireOrderForBuyer(tx, buyerUserId, orderId);
+    if (!order.shareToken) return;
+    await ordersRepo.setShareToken(tx, orderId, null);
+    await auditService.record(tx, { tenantId, actorUserId: buyerUserId, entityType: 'order', entityId: orderId, action: 'order.share_disabled' });
+  });
+}
+
+export interface SharedOrderItem {
+  /** What to add to a cart; null for a product that no longer exists. */
+  productId: string | null;
+  nameEs: string;
+  nameEn: string | null;
+  unitLabel: string;
+  quantity: number;
+  /** Today's price and whether it can be bought now (the cart reprices again on its own). */
+  priceCents: number | null;
+  available: boolean;
+}
+
+export interface SharedOrder {
+  items: SharedOrderItem[];
+  /** Only for the store's own staff: which order this is, so they can open it in the admin. Null for everyone else. */
+  orderId: string | null;
+  orderNumber: string | null;
+}
+
+// What a visitor sees through a share link. `viewerRole` is the signed-in person's role, if any: store staff get the
+// order's id (to be sent to it in the admin); nobody else learns anything about the order beyond its products.
+async function getSharedOrder(tenantId: string, token: string, viewerRole?: string): Promise<SharedOrder> {
+  const { order, items } = await withTenant(tenantId, async (tx) => {
+    const found = await ordersRepo.findByShareToken(tx, token);
+    if (!found) throw new NotFoundError('This link is not valid anymore');
+    return { order: found, items: await ordersRepo.listItems(tx, found.id) };
+  });
+  const productIds = items.flatMap((item) => (item.productId ? [item.productId] : []));
+  const snapshots = new Map((await catalogService.getProductSnapshots(tenantId, productIds)).map((p) => [p.id, p]));
+  const isStaff = viewerRole === 'admin' || viewerRole === 'staff';
+  return {
+    items: items.map((item) => {
+      const live = item.productId ? snapshots.get(item.productId) : undefined;
+      return {
+        productId: live ? live.id : null,
+        nameEs: live?.nameEs ?? item.productNameSnapshot,
+        nameEn: live ? live.nameEn : item.productNameEnSnapshot,
+        unitLabel: live?.unitLabel ?? item.unitLabelSnapshot,
+        quantity: item.quantity,
+        priceCents: live ? live.priceCents : null,
+        available: Boolean(live && live.active && live.stockStatus !== 'out'),
+      };
+    }),
+    orderId: isStaff ? order.id : null,
+    orderNumber: isStaff ? order.orderNumber : null,
+  };
 }
 
 // --- reacting to confirmed payments (event bus subscriber) ------------------
@@ -1072,7 +1280,8 @@ async function handlePaymentConfirmed(tenantId: string, orderId: string): Promis
 }
 
 async function handlePaymentRefunded(tenantId: string, orderId: string): Promise<void> {
-  await withTenant(tenantId, (tx) => transition(tx, tenantId, orderId, 'refunded', undefined, 'Refunded by payment provider'));
+  const { changed } = await withTenant(tenantId, (tx) => transitionTracked(tx, tenantId, orderId, 'refunded', undefined, 'Refunded by payment provider'));
+  if (changed) await announceStatus(tenantId, orderId, 'refunded');
 }
 
 // --- reconciliation (CLAUDE.md section 6) -----------------------------------
@@ -1084,20 +1293,29 @@ async function handlePaymentRefunded(tenantId: string, orderId: string): Promise
 // the age check.
 const RECONCILE_POLL_AFTER_HOURS = 24;
 const RECONCILE_CANCEL_AFTER_HOURS = 72;
+// One reminder, a day before the cancellation, to orders nobody has reported paying for.
+const REMIND_AFTER_HOURS = 48;
 
 export interface ReconciliationResult {
   checked: number;
   selfHealed: number;
   cancelled: number;
+  reminded: number;
 }
 
 async function reconcilePendingPayments(tenantId: string, now: Date = new Date()): Promise<ReconciliationResult> {
   const pollCutoff = new Date(now.getTime() - RECONCILE_POLL_AFTER_HOURS * 60 * 60 * 1000);
   const cancelCutoff = new Date(now.getTime() - RECONCILE_CANCEL_AFTER_HOURS * 60 * 60 * 1000);
+  const remindCutoff = new Date(now.getTime() - REMIND_AFTER_HOURS * 60 * 60 * 1000);
 
-  const stale = await withTenant(tenantId, (tx) => ordersRepo.findStalePendingPayment(tx, pollCutoff));
+  const { stale, reported } = await withTenant(tenantId, async (tx) => ({
+    stale: await ordersRepo.findStalePendingPayment(tx, pollCutoff),
+    // Someone who says they paid is waiting on us, not the other way round: no reminder for them.
+    reported: new Set(await paymentsService.listOrderIdsWithTransferReport(tx)),
+  }));
   let selfHealed = 0;
   let cancelled = 0;
+  let reminded = 0;
 
   for (const order of stale) {
     try {
@@ -1107,10 +1325,11 @@ async function reconcilePendingPayments(tenantId: string, now: Date = new Date()
         try {
           const status = await paymentsService.getProvider(payment.provider).getStatus(payment.externalPaymentId);
           if (status === 'paid') {
-            await withTenant(tenantId, async (tx) => {
+            const { changed } = await withTenant(tenantId, async (tx) => {
               await paymentsService.markStatus(tx, payment.id, 'paid');
-              await transition(tx, tenantId, order.id, 'paid', undefined, 'Self-healed by reconciliation');
+              return transitionTracked(tx, tenantId, order.id, 'paid', undefined, 'Self-healed by reconciliation');
             });
+            if (changed) await announceStatus(tenantId, order.id, 'paid');
             selfHealed += 1;
             continue;
           }
@@ -1124,7 +1343,14 @@ async function reconcilePendingPayments(tenantId: string, now: Date = new Date()
           await paymentsService.markStatus(tx, payment.id, 'failed');
           await transition(tx, tenantId, order.id, 'cancelled', undefined, 'Auto-cancelled: never paid within 72h');
         });
+        await announceStatus(tenantId, order.id, 'cancelled', 'unpaid');
         cancelled += 1;
+      } else if (order.placedAt && order.placedAt < remindCutoff && !reported.has(order.id)) {
+        const claimed = await withTenant(tenantId, (tx) => ordersRepo.claimPaymentReminder(tx, order.id, now));
+        if (claimed) {
+          await events.emit('order.payment_reminder', { orderId: order.id, tenantId });
+          reminded += 1;
+        }
       }
     } catch (err) {
       // One order's failure must not stop the rest of the tenant's batch.
@@ -1132,7 +1358,7 @@ async function reconcilePendingPayments(tenantId: string, now: Date = new Date()
     }
   }
 
-  return { checked: stale.length, selfHealed, cancelled };
+  return { checked: stale.length, selfHealed, cancelled, reminded };
 }
 
 // The only public surface other modules may import (via index.ts).
@@ -1152,6 +1378,9 @@ export const ordersService = {
   listOrdersForBuyer,
   getOrderForAdmin,
   listOrdersForAdmin,
+  pageOrdersForAdmin,
+  pageOrdersForBuyer,
+  adminOrderCounts,
   retryPayment,
   getPaymentInstructions,
   reportTransfer,
@@ -1166,6 +1395,10 @@ export const ordersService = {
   handlePaymentConfirmed,
   handlePaymentRefunded,
   reconcilePendingPayments,
+  getShare,
+  enableShare,
+  disableShare,
+  getSharedOrder,
 };
 
 // Exported for the worker's registration and for tests that need the full

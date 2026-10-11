@@ -13,13 +13,26 @@ export interface RateLimitStore {
   increment(key: string, windowSeconds: number): Promise<{ count: number; retryAfterSeconds: number }>;
 }
 
+// Adding the hit and making sure the window has an expiry must be ONE step. The earlier version set the expiry with one
+// command and counted with another: if the key expired in between, the count recreated it with no expiry at all, and
+// that address was refused for ever (found when a dev machine stayed blocked for hours: the counter read 404 with a
+// TTL of -1). Inside one script nothing can interleave. The expiry is set by the first hit only, so later hits cannot
+// extend the window (which would let a steady trickle stay under the limit for ever); a counter that somehow has no
+// expiry (TTL < 0, left by the old version) is repaired by the next hit.
+const HIT_SCRIPT = `
+local count = redis.call('INCR', KEYS[1])
+local ttl = redis.call('TTL', KEYS[1])
+if count == 1 or ttl < 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+  ttl = tonumber(ARGV[1])
+end
+return {count, ttl}
+`;
+
 export function createRedisStore(redis: Redis): RateLimitStore {
   return {
     async increment(key, windowSeconds) {
-      // NX: only the first hit of a window sets the expiry, later hits can't
-      // extend it (which would let a steady trickle stay under the limit forever).
-      await redis.set(key, 0, 'EX', windowSeconds, 'NX');
-      const [count, ttl] = await Promise.all([redis.incr(key), redis.ttl(key)]);
+      const [count, ttl] = (await redis.eval(HIT_SCRIPT, 1, key, windowSeconds)) as [number, number];
       return { count, retryAfterSeconds: ttl > 0 ? ttl : windowSeconds };
     },
   };

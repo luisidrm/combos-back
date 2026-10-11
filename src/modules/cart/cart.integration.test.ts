@@ -1,6 +1,7 @@
 import type postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { defaultCategory } from '../../db/testing/default-category.js';
 import { startTestDatabase, type TestDatabase } from '../../db/testing/test-database.js';
 import type { catalogService as catalogServiceType } from '../catalog/index.js';
 import type { cartService as cartServiceType } from './index.js';
@@ -30,6 +31,7 @@ describe('cart module', () => {
     { priceCents = 1000, maxPerOrder, stockStatus }: { priceCents?: number; maxPerOrder?: number; stockStatus?: 'available' | 'limited' | 'out' } = {},
   ) {
     const product = await catalog.createProduct(tenantId, {
+      categoryId: await defaultCategory(catalog, tenantId),
       nameEs: name,
       priceCents,
       unitLabel: '1 lb',
@@ -115,7 +117,7 @@ describe('cart module', () => {
 
   describe('what may be added', () => {
     it('refuses a draft, an unknown product, and an out-of-stock one', async () => {
-      const draft = await catalog.createProduct(tenantA, { nameEs: 'Borrador Cart', priceCents: 100, unitLabel: 'u' });
+      const draft = await catalog.createProduct(tenantA, { categoryId: await defaultCategory(catalog, tenantA), nameEs: 'Borrador Cart', priceCents: 100, unitLabel: 'u' });
       await expect(cart.addItem(tenantA, {}, { productId: draft.id, quantity: 1 })).rejects.toBeInstanceOf(NotFoundError);
       await expect(cart.addItem(tenantA, {}, { productId: crypto.randomUUID(), quantity: 1 })).rejects.toBeInstanceOf(
         NotFoundError,
@@ -242,7 +244,7 @@ describe('cart module', () => {
       const fresh = await liveProduct(tenantA, 'Merge Nuevo');
       const capped = await liveProduct(tenantA, 'Merge Tope', { maxPerOrder: 3 });
       const out = await liveProduct(tenantA, 'Merge Agotado', { stockStatus: 'out' });
-      const draft = await catalog.createProduct(tenantA, { nameEs: 'Merge Borrador', priceCents: 100, unitLabel: 'u' });
+      const draft = await catalog.createProduct(tenantA, { categoryId: await defaultCategory(catalog, tenantA), nameEs: 'Merge Borrador', priceCents: 100, unitLabel: 'u' });
 
       const view = await cart.mergeCart(
         tenantA,

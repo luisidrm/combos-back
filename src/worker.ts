@@ -1,15 +1,20 @@
 // The background-job process — distinct from main.ts (the Express API),
-// per CLAUDE.md §3's `worker` service. Run with `npm run worker:dev`
-// alongside `npm run dev`, not inside it: BullMQ consumers have no
-// business sharing a process with the HTTP server.
+// per CLAUDE.md §3's `worker` service. `npm run dev` starts it next to the
+// API (`npm run worker:dev` runs it alone), but never inside it: BullMQ
+// consumers have no business sharing a process with the HTTP server.
 import { events } from './core/events.js';
 import { logger } from './core/logger.js';
+import { initMonitoring, reportUncaughtErrors } from './core/monitoring.js';
+import { startWorkerHeartbeat } from './core/worker-heartbeat.js';
 import { cartService } from './modules/cart/index.js';
 import { registerCatalogWorker } from './modules/catalog/index.js';
 import { mediaService, registerMediaWorker } from './modules/media/index.js';
-import { registerNotificationsWorker } from './modules/notifications/index.js';
+import { notificationsService, registerNotificationsWorker } from './modules/notifications/index.js';
 import { registerOrdersWorker, runOrderReconciliation } from './modules/orders/index.js';
 import { tenancyService } from './modules/tenancy/index.js';
+
+initMonitoring('worker');
+reportUncaughtErrors();
 
 registerMediaWorker();
 registerCatalogWorker();
@@ -32,6 +37,8 @@ async function runMaintenance(): Promise<void> {
       staleCarts += await cartService.purgeStaleGuestCarts(tenantId);
       // The 24h self-heal / 72h auto-cancel pass (CLAUDE.md section 6).
       await runOrderReconciliation(tenantId);
+      // The bell keeps what is recent.
+      await notificationsService.pruneOld(tenantId);
     } catch (err) {
       // One tenant's failure must not stop the others being tidied.
       logger.error({ err, tenantId }, 'Maintenance failed for a tenant');
@@ -47,12 +54,14 @@ function scheduleMaintenance(): NodeJS.Timeout {
 }
 
 const maintenanceTimer = scheduleMaintenance();
+const heartbeatTimer = startWorkerHeartbeat();
 
 // Finish the job in hand, then disconnect, instead of dying mid-processing
 // (a killed job is retried by the bus, but a clean stop is kinder).
 async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'Worker shutting down');
   clearInterval(maintenanceTimer);
+  clearInterval(heartbeatTimer);
   await events.close();
   process.exit(0);
 }

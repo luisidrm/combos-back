@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import { boolean, integer, pgTable, text, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
+import { pageQuerySchema } from '../../core/pagination.js';
 import { tenantIsolationPolicy } from '../../db/rls.js';
 
 export const categories = pgTable(
@@ -114,7 +115,9 @@ export const createProductSchema = z.object({
   nameEn: nameSchema.optional(),
   descriptionEs: z.string().trim().max(5000).nullable().optional(),
   descriptionEn: z.string().trim().max(5000).nullable().optional(),
-  categoryId: z.string().uuid().nullable().optional(),
+  // Every product belongs to a category (the owner's rule): required on create, and an edit can change it
+  // but never clear it.
+  categoryId: z.string().uuid(),
   // Money is integer cents, never a float (CLAUDE.md section 5).
   priceCents: z.number().int().positive().max(100_000_000),
   unitLabel: z.string().trim().min(1).max(50),
@@ -136,14 +139,19 @@ export type ReorderInput = z.infer<typeof reorderSchema>;
 export const idParamSchema = z.object({ id: z.string().uuid() });
 export const slugParamSchema = z.object({ slug: slugSchema });
 
-export const adminProductsQuerySchema = z.object({
+// Both product lists are served a page at a time (?cursor=&limit=), in the owner's chosen order.
+export const adminProductsQuerySchema = pageQuerySchema.extend({
   categoryId: z.string().uuid().optional(),
+  // Searches the name (either language) and the slug.
+  q: z.string().trim().min(1).max(100).optional(),
   active: z
     .enum(['true', 'false'])
     .optional()
     .transform((value) => (value === undefined ? undefined : value === 'true')),
 });
 
-export const publicProductsQuerySchema = z.object({
+export const publicProductsQuerySchema = pageQuerySchema.extend({
   categoryId: z.string().uuid().optional(),
+  // The shop's search box: matches the name (either language) of live products.
+  q: z.string().trim().min(1).max(100).optional(),
 });

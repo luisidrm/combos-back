@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import { db } from '../db/client.js';
 import { MEDIA_BUCKET, minioClient } from './minio.js';
 import { redisConnection } from './queue.js';
+import { workerIsAlive } from './worker-heartbeat.js';
 
 const CHECK_TIMEOUT_MS = 2000;
 
@@ -26,6 +27,9 @@ export type CheckResult = 'ok' | 'failed';
 export interface Readiness {
   ok: boolean;
   checks: Record<'postgres' | 'redis' | 'minio', CheckResult>;
+  /** Whether the worker process has reported in lately. Informational: the API serves without it, but pictures
+   * stay on "Processing" and email is not sent, so a monitor should alert on it. */
+  worker?: 'ok' | 'down';
 }
 
 async function run(check: () => Promise<unknown>): Promise<CheckResult> {
@@ -48,5 +52,6 @@ export async function checkReadiness(): Promise<Readiness> {
     run(() => redisConnection.ping()),
     run(() => minioClient.bucketExists(MEDIA_BUCKET)),
   ]);
-  return { ok: postgres === 'ok' && redis === 'ok' && minio === 'ok', checks: { postgres, redis, minio } };
+  const worker = redis === 'ok' && (await workerIsAlive().catch(() => false)) ? 'ok' : 'down';
+  return { ok: postgres === 'ok' && redis === 'ok' && minio === 'ok', checks: { postgres, redis, minio }, worker };
 }

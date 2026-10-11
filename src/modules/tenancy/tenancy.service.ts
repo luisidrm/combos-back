@@ -3,7 +3,7 @@ import { db } from '../../db/client.js';
 import { isUniqueViolation } from '../../db/errors.js';
 import { mediaService, type PublicPicture } from '../media/index.js';
 import * as tenancyRepo from './tenancy.repo.js';
-import type { CreateTenantInput, OpeningHours, StoreContact, Tenant, TenantSettings, UpdateTenantInput } from './tenancy.schema.js';
+import type { CreateTenantInput, StoreContact, Tenant, TenantSettings, UpdateTenantInput } from './tenancy.schema.js';
 
 // What a visitor needs to tell one shop from another (CLAUDE.md section 5):
 // no id, no settings, no timestamps.
@@ -20,7 +20,6 @@ export interface PublicStore {
   freeDeliveryOverCents: number | null;
   sameDayCutoff: string | null;
   contact: StoreContact;
-  openingHours: OpeningHours | null;
 }
 
 async function resolveBySlug(slug: string): Promise<Tenant> {
@@ -81,7 +80,6 @@ function pickPublicSettings(settings: TenantSettings) {
     freeDeliveryOverCents: settings.freeDeliveryOverCents,
     sameDayCutoff: settings.sameDayCutoff,
     contact: settings.contact,
-    openingHours: settings.openingHours,
   };
 }
 
@@ -93,7 +91,6 @@ function readSettings(tenant: Tenant): TenantSettings {
     freeDeliveryOverCents: typeof raw.free_delivery_over_cents === 'number' ? raw.free_delivery_over_cents : null,
     sameDayCutoff: text(raw.same_day_cutoff),
     contact: { phone: text(raw.contact_phone), email: text(raw.contact_email), address: text(raw.contact_address) },
-    openingHours: Array.isArray(raw.opening_hours) ? (raw.opening_hours as OpeningHours) : null,
   };
 }
 
@@ -118,9 +115,6 @@ async function updateStore(
   }
   if (input.settings?.sameDayCutoff !== undefined) {
     changes.same_day_cutoff = input.settings.sameDayCutoff;
-  }
-  if (input.settings?.openingHours !== undefined) {
-    changes.opening_hours = input.settings.openingHours;
   }
   for (const key of ['phone', 'email', 'address'] as const) {
     const value = input.settings?.contact?.[key];

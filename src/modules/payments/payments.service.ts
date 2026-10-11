@@ -2,13 +2,14 @@ import type { Request } from 'express';
 import { auditService } from '../audit/index.js';
 import { events } from '../../core/events.js';
 import { logger } from '../../core/logger.js';
-import { ConflictError, NotFoundError } from '../../core/errors.js';
+import { config } from '../../config/index.js';
+import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { withTenant, type Transaction } from '../../db/client.js';
-import { listManualMethods, type ManualMethodName } from './manual-methods.js';
+import { accountsFromEnvironment, legacyMethodLabel, toMethodView, type ManualMethodView } from './manual-methods.js';
 import * as paymentsRepo from './payments.repo.js';
 import { ManualTransferProvider } from './providers/manual-transfer.provider.js';
 import { TropiPayProvider } from './providers/tropipay.provider.js';
-import type { Payment } from './payments.schema.js';
+import type { CreateManualMethodInput, ManualPaymentMethod, Payment, UpdateManualMethodInput } from './payments.schema.js';
 import type { PaymentProvider, WebhookResult } from './payments.provider.js';
 
 const providers: Record<string, PaymentProvider> = {
@@ -177,7 +178,10 @@ async function processWebhook(providerName: string, req: Request): Promise<Webho
 // --- manual transfer reports ----------------------------------------------------
 
 export interface TransferReport {
-  method: ManualMethodName;
+  /** The name of the app as the buyer saw it when they sent the money ("Zelle", or whatever the owner called it). */
+  method: string;
+  /** The payment method row, or null for a report from before methods were stored. */
+  methodId: string | null;
   /** The confirmation / transaction number the buyer's app showed. */
   transferReference: string;
   notes: string | null;
@@ -188,16 +192,21 @@ const TRANSFER_REPORTED = 'transfer_reported';
 
 async function recordTransferReport(
   tx: Transaction,
-  input: { tenantId: string; paymentId: string; method: ManualMethodName; transferReference: string; notes?: string | null },
+  input: { tenantId: string; paymentId: string; methodId: string; label: string; transferReference: string; notes?: string | null },
 ): Promise<void> {
   await paymentsRepo.insertEventIfNew(tx, {
     tenantId: input.tenantId,
     paymentId: input.paymentId,
     providerEventId: `manual-report:${crypto.randomUUID()}`,
     eventType: TRANSFER_REPORTED,
-    payload: { method: input.method, transferReference: input.transferReference, notes: input.notes ?? null },
+    payload: { methodId: input.methodId, label: input.label, transferReference: input.transferReference, notes: input.notes ?? null },
     processedAt: new Date(),
   });
+}
+
+// Every order with a transfer report, for the admin's "transfers to check" filter (the caller keeps only unpaid ones).
+async function listOrderIdsWithTransferReport(tx: Transaction): Promise<string[]> {
+  return paymentsRepo.findOrderIdsWithEvent(tx, TRANSFER_REPORTED);
 }
 
 // The latest report per order, for the admin queue and an order's detail.
@@ -205,17 +214,124 @@ async function getLatestTransferReports(tx: Transaction, orderIds: string[]): Pr
   const rows = await paymentsRepo.findLatestReports(tx, TRANSFER_REPORTED, orderIds);
   return new Map(
     rows.map((row) => {
-      const payload = row.payload as { method: ManualMethodName; transferReference: string; notes: string | null };
-      return [row.orderId, { method: payload.method, transferReference: payload.transferReference, notes: payload.notes, reportedAt: row.createdAt }];
+      const payload = row.payload as { method?: string; methodId?: string; label?: string; transferReference: string; notes: string | null };
+      const report: TransferReport = {
+        method: payload.label ?? legacyMethodLabel(payload.method ?? ''),
+        methodId: payload.methodId ?? null,
+        transferReference: payload.transferReference,
+        notes: payload.notes,
+        reportedAt: row.createdAt,
+      };
+      return [row.orderId, report];
     }),
   );
 }
 
+// Card payment exists only when a card provider has credentials. The owner chose manual transfer only for the launch,
+// so with no TropiPay keys set the checkout simply does not offer card (GET /payments/methods says `card: false`).
+function isCardEnabled(): boolean {
+  return Boolean(config.tropipay.clientId && config.tropipay.clientSecret);
+}
+
+// --- manual transfer methods (the accounts a buyer can send money to) --------------------------
+
+export type AdminManualMethod = Omit<ManualPaymentMethod, 'tenantId' | 'deletedAt'>;
+
+function toAdminMethod({ tenantId: _tenantId, deletedAt: _deletedAt, ...rest }: ManualPaymentMethod): AdminManualMethod {
+  return rest;
+}
+
+// A store with no methods yet gets the accounts that used to be set in environment variables, once, so a deployment
+// keeps working. Methods the owner deleted still count as "has methods", so they never come back.
+async function ensureMethodsImported(tx: Transaction, tenantId: string): Promise<void> {
+  if ((await paymentsRepo.countMethodsEver(tx)) > 0) return;
+  await paymentsRepo.lockMethodsImport(tx, tenantId);
+  if ((await paymentsRepo.countMethodsEver(tx)) > 0) return;
+  const seeds = accountsFromEnvironment();
+  for (const [index, seed] of seeds.entries()) {
+    await paymentsRepo.insertMethod(tx, { tenantId, ...seed, sortOrder: index, active: true });
+  }
+  if (seeds.length > 0) {
+    logger.info({ tenantId, count: seeds.length }, 'Imported the manual payment accounts from the environment');
+  }
+}
+
+// What a buyer can pay with right now, with links for exactly `amountCents`: the active methods, in the owner's order.
+async function listManualMethods(tenantId: string, amountCents: number): Promise<ManualMethodView[]> {
+  const rows = await withTenant(tenantId, async (tx) => {
+    await ensureMethodsImported(tx, tenantId);
+    return paymentsRepo.listMethods(tx, { onlyActive: true });
+  });
+  return rows.map((row) => toMethodView(row, amountCents));
+}
+
+// Every method that has not been deleted, including hidden ones, for the owner's Settings screen.
+async function listMethodsForAdmin(tenantId: string): Promise<AdminManualMethod[]> {
+  const rows = await withTenant(tenantId, async (tx) => {
+    await ensureMethodsImported(tx, tenantId);
+    return paymentsRepo.listMethods(tx);
+  });
+  return rows.map(toAdminMethod);
+}
+
+async function createManualMethod(tenantId: string, input: CreateManualMethodInput): Promise<AdminManualMethod> {
+  const row = await withTenant(tenantId, async (tx) => {
+    await ensureMethodsImported(tx, tenantId);
+    return paymentsRepo.insertMethod(tx, {
+      tenantId,
+      kind: input.kind,
+      label: input.label,
+      recipient: input.recipient,
+      handle: input.handle ?? null,
+      linkTemplate: input.linkTemplate ?? null,
+      payeeName: input.payeeName ?? null,
+      instructionsEs: input.instructionsEs ?? null,
+      instructionsEn: input.instructionsEn ?? null,
+      active: input.active ?? true,
+      sortOrder: await paymentsRepo.nextMethodSortOrder(tx),
+    });
+  });
+  return toAdminMethod(row);
+}
+
+async function updateManualMethod(tenantId: string, id: string, input: UpdateManualMethodInput): Promise<AdminManualMethod> {
+  const row = await withTenant(tenantId, (tx) => paymentsRepo.updateMethod(tx, id, input));
+  if (!row) {
+    throw new NotFoundError(`No payment method with id "${id}"`);
+  }
+  return toAdminMethod(row);
+}
+
+// Soft delete: a transfer already reported names the method it was sent with.
+async function deleteManualMethod(tenantId: string, id: string): Promise<void> {
+  if (!(await withTenant(tenantId, (tx) => paymentsRepo.softDeleteMethod(tx, id)))) {
+    throw new NotFoundError(`No payment method with id "${id}"`);
+  }
+}
+
+// The i-th id gets sort order i; every id must be one of this store's methods (a stale list fails whole).
+async function reorderManualMethods(tenantId: string, ids: string[]): Promise<void> {
+  await withTenant(tenantId, async (tx) => {
+    for (const [index, id] of ids.entries()) {
+      if (!(await paymentsRepo.setMethodSortOrder(tx, id, index))) {
+        throw new ValidationError(`No payment method with id "${id}"`);
+      }
+    }
+  });
+}
+
 // The only public surface other modules may depend on (via index.ts).
 export const paymentsService = {
+  isCardEnabled,
   listManualMethods,
+  listMethodsForAdmin,
+  createManualMethod,
+  updateManualMethod,
+  deleteManualMethod,
+  reorderManualMethods,
   recordTransferReport,
   getLatestTransferReports,
+  listOrderIdsWithTransferReport,
   getProvider,
   createPendingPayment,
   attachExternalId,

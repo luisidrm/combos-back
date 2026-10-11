@@ -23,7 +23,7 @@ import { router as geoRouter } from './modules/geo/index.js';
 import { router as identityRouter } from './modules/identity/index.js';
 import { router as mediaRouter } from './modules/media/index.js';
 import { router as notificationsRouter } from './modules/notifications/index.js';
-import { recipientsRouter, router as ordersRouter } from './modules/orders/index.js';
+import { recipientsRouter, router as ordersRouter, sharedRouter } from './modules/orders/index.js';
 import { router as paymentsRouter } from './modules/payments/index.js';
 import { router as tenancyRouter } from './modules/tenancy/index.js';
 
@@ -72,6 +72,20 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
   app.post('/auth/user/password/reset/token', rateLimit({ name: 'password-reset-request-ip', limit: 5, windowSeconds: 15 * 60 }));
   app.post('/auth/user/password/reset', rateLimit({ name: 'password-reset-ip', limit: 20, windowSeconds: 15 * 60 }));
 
+  // Writes that cost something: they create orders and payments, store files, or hand out access.
+  // Counted per client IP (these run before the session is read, so a per-user key is not available);
+  // generous enough for a family behind one connection, tight enough to stop a script.
+  const writesOnly = (req: express.Request) => req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS';
+  app.use('/orders/checkout', rateLimit({ name: 'checkout-ip', limit: 20, windowSeconds: 10 * 60, skip: writesOnly }));
+  app.use('/orders/quote', rateLimit({ name: 'quote-ip', limit: 60, windowSeconds: 60 }));
+  // "I sent the transfer": a person does this once or twice per order.
+  app.post('/orders/:id/transfer-report', rateLimit({ name: 'transfer-report-ip', limit: 10, windowSeconds: 15 * 60 }));
+  // Asking for an upload slot reserves storage; the file itself goes straight to MinIO.
+  app.post('/media/upload-url', rateLimit({ name: 'upload-url-ip', limit: 60, windowSeconds: 10 * 60 }));
+  // Adding people to the team, and re-sending their invite email.
+  app.post('/identity/team', rateLimit({ name: 'team-add-ip', limit: 20, windowSeconds: 60 * 60 }));
+  app.post('/identity/team/:id/invite', rateLimit({ name: 'team-invite-ip', limit: 10, windowSeconds: 60 * 60 }));
+
   // Payment webhooks need their exact raw bytes to verify a signature — once
   // express.json() below has parsed and discarded them, they cannot be
   // recovered, so this has to run first and only for this one path.
@@ -92,11 +106,14 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
   app.get('/ready', async (_req, res, next) => {
     try {
       const readiness = await checkReadiness();
-      res.status(readiness.ok ? 200 : 503).json({ status: readiness.ok ? 'ok' : 'unavailable', checks: readiness.checks });
+      res.status(readiness.ok ? 200 : 503).json({ status: readiness.ok ? 'ok' : 'unavailable', checks: readiness.checks, worker: readiness.worker });
     } catch (err) {
       next(err);
     }
   });
+
+  // A share link is public: its token is unguessable, and this keeps anyone from trying many.
+  app.use('/shared', rateLimit({ name: 'shared-ip', limit: 60, windowSeconds: 60 }));
 
   // Anyone can create a guest cart, so cart writes get their own, tighter limit.
   app.use('/cart', rateLimit({ name: 'cart-write-ip', limit: 60, windowSeconds: 60, skip: (req) => req.method === 'GET' }));
@@ -122,6 +139,7 @@ export function createApp({ rateLimitStore = createRedisStore(redisConnection) }
   mount('/cart', cartRouter);
   mount('/orders', ordersRouter);
   mount('/recipients', recipientsRouter);
+  mount('/shared', sharedRouter);
   mount('/payments', paymentsRouter);
   mount('/fulfilment', fulfilmentRouter);
   mount('/notifications', notificationsRouter);

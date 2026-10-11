@@ -1,5 +1,6 @@
 import { Queue, Worker, type Job } from 'bullmq';
 import { logger } from './logger.js';
+import { reportError } from './monitoring.js';
 import { redisConnection } from './queue.js';
 import { getRequestId, runWithRequestId } from './request-context.js';
 
@@ -73,9 +74,13 @@ function on<TPayload extends Record<string, unknown>>(
   // Without a listener, an 'error' event (a Redis blip) is an unhandled
   // EventEmitter error, which Node treats as fatal.
   worker.on('error', (err) => logger.error({ err, event: eventName }, 'Event worker error'));
-  worker.on('failed', (job, err) =>
-    logger.warn({ err, event: eventName, attempt: job?.attemptsMade }, 'Event handler failed'),
-  );
+  worker.on('failed', (job, err) => {
+    logger.warn({ err, event: eventName, attempt: job?.attemptsMade }, 'Event handler failed');
+    // Only the last attempt is worth a report: the earlier ones retry by themselves.
+    if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
+      reportError(err, { event: eventName, attempts: job.attemptsMade });
+    }
+  });
 
   workers.push(worker);
   return worker;

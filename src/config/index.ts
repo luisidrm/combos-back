@@ -40,13 +40,20 @@ export const config = {
   supertokens: {
     connectionUri: env.SUPERTOKENS_CONNECTION_URI,
     apiKey: env.SUPERTOKENS_API_KEY,
+    cookieDomain: env.COOKIE_DOMAIN,
   },
 
   platformApiKey: env.PLATFORM_API_KEY,
 
+  // Null unless both keys are set: the Google recipe is only registered then.
+  google: env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET ? { clientId: env.GOOGLE_CLIENT_ID, clientSecret: env.GOOGLE_CLIENT_SECRET } : null,
+
   resendApiKey: env.RESEND_API_KEY,
   emailFrom: env.EMAIL_FROM,
   sendEmails: env.SEND_EMAILS ? env.SEND_EMAILS === 'true' : env.NODE_ENV === 'production',
+
+  sentryDsn: env.SENTRY_DSN,
+  sentryEnvironment: env.SENTRY_ENVIRONMENT ?? env.NODE_ENV,
 
   // Manual transfer accounts (Zelle / Cash App / PayPal). Per-store settings arrive with M7.
   manualPayments: {

@@ -9,3 +9,9 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# The production environment template is documentation, not a secret.
+!deploy/.env.production.example
+
+# Rendered by npm run emails:preview
+email-previews/

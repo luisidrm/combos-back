@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import { boolean, integer, jsonb, numeric, pgTable, text, timestamp, uniqueIndex, uuid, varchar } from 'drizzle-orm/pg-core';
 import { z } from 'zod';
+import { pageQuerySchema } from '../../core/pagination.js';
 import { tenantIsolationPolicy } from '../../db/rls.js';
 
 // The buyer's address book: people in Cuba they send to, saved once and
@@ -106,6 +107,16 @@ export const orders = pgTable(
     deliveryFeeCents: integer('delivery_fee_cents').notNull(),
     totalCents: integer('total_cents').notNull(),
     placedAt: timestamp('placed_at', { withTimezone: true }),
+    // The buyer's checkout attempt (a random key the browser makes once per attempt). Sending the same key again —
+    // a double click, a retry after a dropped connection — returns the order that attempt already made instead of a
+    // second one. Optional: orders from before this existed have none.
+    checkoutKey: varchar('checkout_key', { length: 64 }),
+    // The link the buyer shares so someone else can see the products of this order and add them to their own cart.
+    // An unguessable random value (256 bits); null = not shared. Anyone holding it sees the product list only (no
+    // address, phone, photo or price paid), and the buyer can switch it off, which kills the link at once.
+    shareToken: varchar('share_token', { length: 64 }),
+    // Set once, when the "still waiting for your payment" reminder was queued, so it is never sent twice.
+    paymentReminderSentAt: timestamp('payment_reminder_sent_at', { withTimezone: true }),
     paidAt: timestamp('paid_at', { withTimezone: true }),
     deliveredAt: timestamp('delivered_at', { withTimezone: true }),
     cancelledAt: timestamp('cancelled_at', { withTimezone: true }),
@@ -115,6 +126,12 @@ export const orders = pgTable(
   (table) => [
     tenantIsolationPolicy(table.tenantId),
     uniqueIndex('orders_tenant_order_number_unique').on(table.tenantId, table.orderNumber),
+    uniqueIndex('orders_share_token_unique')
+      .on(table.shareToken)
+      .where(sql`${table.shareToken} is not null`),
+    uniqueIndex('orders_tenant_buyer_checkout_key_unique')
+      .on(table.tenantId, table.buyerUserId, table.checkoutKey)
+      .where(sql`${table.checkoutKey} is not null`),
   ],
 );
 
@@ -239,15 +256,16 @@ export const checkoutSchema = z.object({
   recipientId: z.string().uuid(),
   addressId: z.string().uuid(),
   provider: z.enum(providerNames),
+  // One random value per checkout attempt (see orders.checkout_key). The web app always sends it.
+  idempotencyKey: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/, 'letters, digits, - and _ only (8-64)').optional(),
   giftMessage: z.string().trim().max(500).nullable().optional(),
   buyerNotes: z.string().trim().max(1000).nullable().optional(),
 });
 export type CheckoutInput = z.infer<typeof checkoutSchema>;
 
-// The manual transfer apps (kept as a literal here: a schema file must not import another module's
-// runtime code, see CLAUDE.md section 13).
+// Which of the store's payment methods (a payments row) the money was sent with.
 export const transferReportSchema = z.object({
-  method: z.enum(['zelle', 'cashapp', 'paypal']),
+  methodId: z.string().uuid(),
   transferReference: z.string().trim().min(3).max(100),
   notes: z.string().trim().max(500).nullable().optional(),
 });
@@ -255,10 +273,22 @@ export type TransferReportInput = z.infer<typeof transferReportSchema>;
 
 export const orderIdParamSchema = z.object({ id: z.string().uuid() });
 
+// What a share link looks like: base64url of 32 random bytes. Anything else is not ours: no database lookup.
+export const shareTokenParamSchema = z.object({ token: z.string().regex(/^[A-Za-z0-9_-]{43}$/, 'not a share link') });
+
 export const statsQuerySchema = z.object({ range: z.enum(['week', 'month', 'year']).default('week') });
 
-export const adminOrdersQuerySchema = z.object({
+// The buyer's own list: "active" = still in progress, "past" = finished (delivered, cancelled or refunded).
+export const buyerOrdersQuerySchema = pageQuerySchema.extend({
+  scope: z.enum(['active', 'past']).optional(),
+});
+
+// The admin queue: filters are applied by the server (the screen only ever holds one page), so `filter=transfer` means
+// "unpaid orders whose buyer reported a transfer" and `q` searches the order number, the recipient and the buyer.
+export const adminOrdersQuerySchema = pageQuerySchema.extend({
   status: z.enum(orderStatuses).optional(),
+  filter: z.enum(['transfer']).optional(),
+  q: z.string().trim().min(1).max(100).optional(),
 });
 
 // Every field here is optional, so a client that sends no body at all (a

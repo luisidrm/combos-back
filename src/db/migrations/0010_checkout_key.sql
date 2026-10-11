@@ -1,0 +1,2 @@
+ALTER TABLE "orders" ADD COLUMN "checkout_key" varchar(64);--> statement-breakpoint
+CREATE UNIQUE INDEX "orders_tenant_buyer_checkout_key_unique" ON "orders" USING btree ("tenant_id","buyer_user_id","checkout_key") WHERE "orders"."checkout_key" is not null;

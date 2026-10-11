@@ -2,6 +2,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type postgres from 'postgres';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { defaultCategory } from './db/testing/default-category.js';
 import { startTestDatabase, type TestDatabase } from './db/testing/test-database.js';
 import type { catalogService as catalogServiceType } from './modules/catalog/index.js';
 
@@ -47,6 +48,7 @@ describe('the app over HTTP, with a database', () => {
   ) {
     const tenantId = tenantIds[tenantSlug] as string;
     const product = await catalog.createProduct(tenantId, {
+      categoryId: await defaultCategory(catalog, tenantId),
       nameEs: name,
       priceCents: options.priceCents ?? 1000,
       unitLabel: '1 lb',
@@ -130,7 +132,6 @@ describe('the app over HTTP, with a database', () => {
         freeDeliveryOverCents: null,
         sameDayCutoff: null,
         contact: { phone: null, email: null, address: null },
-        openingHours: null,
         logo: null,
       });
     });
@@ -159,10 +160,10 @@ describe('the app over HTTP, with a database', () => {
   describe('the storefront', () => {
     it('lists live products with picture URLs, never internals', async () => {
       const product = await liveProduct('shop-a', 'Pollo Ahumado', { priceCents: 1850 });
-      const list = await json<Array<{ id: string; slug: string; cover: { cardUrl: string } }>>(
+      const list = await json<{ items: Array<{ id: string; slug: string; cover: { cardUrl: string } }>; nextCursor: string | null }>(
         await api('/catalog/products', { tenant: 'shop-a' }),
       );
-      const listed = list.find((p) => p.id === product.id);
+      const listed = list.items.find((p) => p.id === product.id);
       expect(listed?.slug).toBe('pollo-ahumado');
       expect(listed?.cover.cardUrl).toMatch(/\/public\/.+\.card\.webp$/);
 
@@ -180,7 +181,7 @@ describe('the app over HTTP, with a database', () => {
     });
 
     it("does not show one store's products in another", async () => {
-      expect(await json(await api('/catalog/products', { tenant: 'shop-b' }))).toEqual([]);
+      expect(await json(await api('/catalog/products', { tenant: 'shop-b' }))).toEqual({ items: [], nextCursor: null });
     });
 
     it('serves only public pictures, and refuses to list private ones', async () => {

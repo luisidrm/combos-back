@@ -1,8 +1,11 @@
 import { createApp } from './app.js';
 import { config } from './config/index.js';
 import { logger } from './core/logger.js';
+import { initMonitoring, reportUncaughtErrors } from './core/monitoring.js';
 import { initSupertokens } from './core/supertokens.js';
 
+initMonitoring('api');
+reportUncaughtErrors();
 initSupertokens();
 
 const app = createApp();

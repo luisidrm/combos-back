@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      # The integration tests build a throwaway database on this server (see src/db/testing/test-database.ts); they
+      # connect as a restricted role, so row-level security is really exercised.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: combo_shop
+          POSTGRES_PASSWORD: combo_shop
+          POSTGRES_DB: combo_shop
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U combo_shop"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+
+    env:
+      TEST_DATABASE_ADMIN_URL: postgres://combo_shop:combo_shop@127.0.0.1:5432/combo_shop
+      # The rate limiter's Lua script is tested against a real Redis (src/core/rate-limit.redis.test.ts).
+      TEST_REDIS_URL: redis://127.0.0.1:6379
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      # The production build must compile without the tests, and the migrations must apply to an empty database.
+      - run: npm run build
+      - name: Migrations apply to an empty database
+        run: |
+          psql "postgres://combo_shop:combo_shop@127.0.0.1:5432/postgres" -c "CREATE DATABASE migration_check"
+          DATABASE_ADMIN_URL="postgres://combo_shop:combo_shop@127.0.0.1:5432/migration_check" npm run migrate

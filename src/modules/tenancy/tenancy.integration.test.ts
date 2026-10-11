@@ -71,11 +71,10 @@ describe('tenancy module', () => {
         freeDeliveryOverCents: null,
         sameDayCutoff: null,
         contact: { phone: null, email: null, address: null },
-        openingHours: null,
         logo: null,
       });
       expect(Object.keys(view).sort()).toEqual(
-        ['contact', 'descriptionEn', 'descriptionEs', 'freeDeliveryOverCents', 'logo', 'name', 'openingHours', 'sameDayCutoff', 'slug', 'taglineEn', 'taglineEs'],
+        ['contact', 'descriptionEn', 'descriptionEs', 'freeDeliveryOverCents', 'logo', 'name', 'sameDayCutoff', 'slug', 'taglineEn', 'taglineEs'],
       );
     });
 
@@ -131,23 +130,21 @@ describe('tenancy module', () => {
       expect((await tenancy.updateStore(shop.id, { settings: { freeDeliveryOverCents: null } })).freeDeliveryOverCents).toBeNull();
     });
 
-    it('stores contact details, opening hours and the same-day cutoff, and shows them publicly', async () => {
+    it('stores contact details and the same-day cutoff, and shows them publicly', async () => {
       const shop = await create('profile');
-      const hours = [...Array(6).fill({ open: '08:00', close: '18:00' }), null];
       const updated = await tenancy.updateStore(shop.id, {
-        settings: { contact: { phone: '+53 42 21 5566', email: 'pedidos@shop.test', address: 'Calle 1 #2' }, openingHours: hours, sameDayCutoff: '14:00' },
+        settings: { contact: { phone: '+53 42 21 5566', email: 'pedidos@shop.test', address: 'Calle 1 #2' }, sameDayCutoff: '14:00' },
       });
       expect(updated).toMatchObject({
         sameDayCutoff: '14:00',
         contact: { phone: '+53 42 21 5566', email: 'pedidos@shop.test', address: 'Calle 1 #2' },
-        openingHours: hours,
       });
-      expect(await tenancy.getPublicStore(shop.id)).toMatchObject({ sameDayCutoff: '14:00', openingHours: hours });
+      expect(await tenancy.getPublicStore(shop.id)).toMatchObject({ sameDayCutoff: '14:00' });
 
       // A partial contact edit changes only that field; an empty string clears one.
       const edited = await tenancy.updateStore(shop.id, { settings: { contact: { phone: '' } } });
       expect(edited.contact).toEqual({ phone: null, email: 'pedidos@shop.test', address: 'Calle 1 #2' });
-      expect((await tenancy.updateStore(shop.id, { settings: { sameDayCutoff: null, openingHours: null } })).sameDayCutoff).toBeNull();
+      expect((await tenancy.updateStore(shop.id, { settings: { sameDayCutoff: null } })).sameDayCutoff).toBeNull();
     });
 
     it('treats an empty edit as a no-op', async () => {

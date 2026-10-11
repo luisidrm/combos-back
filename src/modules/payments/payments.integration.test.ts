@@ -244,4 +244,102 @@ describe('payments module', () => {
       await expect(payments.processWebhook('tropipay', {} as Request)).rejects.toBeInstanceOf(ConflictError);
     });
   });
+
+  // The accounts buyers send money to, edited by the owner (instead of environment variables).
+  describe('manual transfer methods', () => {
+    const zelle = { kind: 'zelle', label: 'Zelle', recipient: 'pay@example.com' } as const;
+
+    it("keeps one store's methods out of another's (the cross-tenant read test)", async () => {
+      const mine = await payments.createManualMethod(tenantA, zelle);
+      expect((await payments.listMethodsForAdmin(tenantB)).map((m) => m.id)).not.toContain(mine.id);
+      expect((await payments.listManualMethods(tenantB, 1000)).map((m) => m.id)).not.toContain(mine.id);
+      // ...and the database itself refuses, not only the service: another store's row cannot be updated or removed.
+      await expect(payments.updateManualMethod(tenantB, mine.id, { label: 'Hijacked' })).rejects.toMatchObject({ httpStatus: 404 });
+      await expect(payments.deleteManualMethod(tenantB, mine.id)).rejects.toMatchObject({ httpStatus: 404 });
+      expect((await payments.listMethodsForAdmin(tenantA)).find((m) => m.id === mine.id)?.label).toBe('Zelle');
+    });
+
+    it('creates, edits and orders methods, and the buyer sees only the active ones, in that order', async () => {
+      const store = crypto.randomUUID();
+      const first = await payments.createManualMethod(store, { ...zelle, instructionsEs: 'Usa el número de pedido' });
+      const cashApp = { kind: 'cashapp', label: 'Cash App', recipient: '$luis', handle: 'luis' } as const;
+      const second = await payments.createManualMethod(store, cashApp);
+      const third = await payments.createManualMethod(store, { kind: 'other', label: 'Mi banco', recipient: '0123', linkTemplate: 'https://bank.example/pay?amount={amount}' });
+      const mine = [first.id, second.id, third.id];
+      const ownLabels = (list: Array<{ id: string; label: string }>) => list.filter((m) => mine.includes(m.id)).map((m) => m.label);
+      expect(ownLabels(await payments.listManualMethods(store, 5550))).toEqual(['Zelle', 'Cash App', 'Mi banco']);
+
+      // hide one: the owner still sees it, the buyer does not
+      await payments.updateManualMethod(store, second.id, { active: false });
+      expect(ownLabels(await payments.listManualMethods(store, 5550))).toEqual(['Zelle', 'Mi banco']);
+      expect(ownLabels(await payments.listMethodsForAdmin(store))).toEqual(['Zelle', 'Cash App', 'Mi banco']);
+
+      // reorder (the ids of the environment accounts imported into a new store go along)
+      const everyId = (await payments.listMethodsForAdmin(store)).map((m) => m.id).filter((id) => !mine.includes(id));
+      await payments.reorderManualMethods(store, [third.id, first.id, second.id, ...everyId]);
+      expect(ownLabels(await payments.listMethodsForAdmin(store))).toEqual(['Mi banco', 'Zelle', 'Cash App']);
+      const bank = (await payments.listManualMethods(store, 5550))[0];
+      expect(bank).toMatchObject({ label: 'Mi banco', link: 'https://bank.example/pay?amount=55.50', amountInLink: true });
+
+      // edit, and clear an optional field with null
+      const edited = await payments.updateManualMethod(store, first.id, { recipient: 'new@example.com', instructionsEs: null });
+      expect(edited).toMatchObject({ recipient: 'new@example.com', instructionsEs: null });
+    });
+
+    it('a store with no methods gets the accounts from the environment once, and deleting them keeps them gone', async () => {
+      const store = crypto.randomUUID();
+      const imported = await payments.listMethodsForAdmin(store);
+      expect(imported.map((m) => m.label)).toEqual(['Zelle', 'Cash App', 'PayPal']);
+      // asking again does not import a second copy
+      expect(await payments.listMethodsForAdmin(store)).toHaveLength(3);
+
+      for (const method of imported) await payments.deleteManualMethod(store, method.id);
+      expect(await payments.listMethodsForAdmin(store)).toEqual([]);
+      expect(await payments.listManualMethods(store, 1000)).toEqual([]);
+    });
+
+    it('refuses to reorder with an id that is not one of the store\'s methods', async () => {
+      const store = crypto.randomUUID();
+      const only = await payments.createManualMethod(store, zelle);
+      await expect(payments.reorderManualMethods(store, [only.id, crypto.randomUUID()])).rejects.toMatchObject({ httpStatus: 400 });
+    });
+
+    it('deleting hides a method from everyone but keeps the row, so a past report can still name it', async () => {
+      const store = crypto.randomUUID();
+      const gone = await payments.createManualMethod(store, zelle);
+      await payments.deleteManualMethod(store, gone.id);
+      expect((await payments.listMethodsForAdmin(store)).map((m) => m.id)).not.toContain(gone.id);
+      expect((await payments.listManualMethods(store, 1000)).map((m) => m.id)).not.toContain(gone.id);
+      const [row] = await adminSql`select deleted_at, active from manual_payment_methods where id = ${gone.id}`;
+      expect(row?.deleted_at).not.toBeNull();
+      await expect(payments.deleteManualMethod(store, gone.id)).rejects.toMatchObject({ httpStatus: 404 });
+    });
+
+    it('a transfer report keeps the name of the method as the buyer saw it, even after it is renamed', async () => {
+      const store = crypto.randomUUID();
+      const method = await payments.createManualMethod(store, zelle);
+      const payment = await withTenant(store, (tx) =>
+        payments.createPendingPayment(tx, { tenantId: store, orderId: crypto.randomUUID(), provider: 'manual', amountCents: 1000, currency: 'USD' }),
+      );
+      await withTenant(store, (tx) =>
+        payments.recordTransferReport(tx, { tenantId: store, paymentId: payment.id, methodId: method.id, label: 'Zelle', transferReference: 'ABC12345' }),
+      );
+      await payments.updateManualMethod(store, method.id, { label: 'Zelle (banco)' });
+      const reports = await withTenant(store, (tx) => payments.getLatestTransferReports(tx, [payment.orderId]));
+      expect(reports.get(payment.orderId)).toMatchObject({ method: 'Zelle', methodId: method.id, transferReference: 'ABC12345' });
+    });
+
+    it('reads a report saved before methods were stored (a bare "cashapp") as the app\'s name', async () => {
+      const store = crypto.randomUUID();
+      const payment = await withTenant(store, (tx) =>
+        payments.createPendingPayment(tx, { tenantId: store, orderId: crypto.randomUUID(), provider: 'manual', amountCents: 1000, currency: 'USD' }),
+      );
+      await adminSql`
+        INSERT INTO payment_events (tenant_id, payment_id, provider_event_id, event_type, payload)
+        VALUES (${store}, ${payment.id}, ${'manual-report:' + crypto.randomUUID()}, 'transfer_reported',
+                ${adminSql.json({ method: 'cashapp', transferReference: 'OLD12345', notes: null })})`;
+      const reports = await withTenant(store, (tx) => payments.getLatestTransferReports(tx, [payment.orderId]));
+      expect(reports.get(payment.orderId)).toMatchObject({ method: 'Cash App', methodId: null });
+    });
+  });
 });

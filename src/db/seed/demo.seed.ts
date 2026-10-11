@@ -147,6 +147,11 @@ const PRODUCTS: Array<{
   { nameEs: 'Café Molido', nameEn: 'Ground Coffee', category: 'drinks', unitLabel: '250 g', priceCents: 750, stockStatus: 'available', descriptionEs: 'Café tostado y molido.', descriptionEn: 'Roasted ground coffee.', hue: 20 },
   { nameEs: 'Jugo de Guayaba', nameEn: 'Guava Juice', category: 'drinks', unitLabel: '1 L', priceCents: 350, stockStatus: 'out', descriptionEs: 'Néctar de guayaba.', descriptionEn: 'Guava nectar.', hue: 345 },
 ];
+// Every product needs a category; the demo data names one for each product, so a missing one is a typo here.
+function failMissingCategory(key: string): never {
+  throw new Error(`Demo product refers to an unknown category "${key}"`);
+}
+
 
 async function seedCatalog(tenantId: string) {
   const existingCategories = await catalogService.listCategoriesForAdmin(tenantId);
@@ -161,14 +166,14 @@ async function seedCatalog(tenantId: string) {
   let created = 0;
   const live: Array<{ id: string; priceCents: number; stockStatus: string }> = [];
   for (const p of PRODUCTS) {
-    let product = existing.find((e) => e.nameEs === p.nameEs);
+    let product: Awaited<ReturnType<typeof catalogService.createProduct>> | undefined = existing.find((e) => e.nameEs === p.nameEs);
     if (!product) {
       product = await catalogService.createProduct(tenantId, {
         nameEs: p.nameEs,
         nameEn: p.nameEn,
         descriptionEs: p.descriptionEs,
         descriptionEn: p.descriptionEn,
-        categoryId: categoryId.get(p.category),
+        categoryId: categoryId.get(p.category) ?? failMissingCategory(p.category),
         priceCents: p.priceCents,
         unitLabel: p.unitLabel,
         stockStatus: p.stockStatus,
@@ -303,6 +308,11 @@ async function seedOrders(
 // --- main --------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // Demo data includes logins (admin, packer, courier, buyers) whose password is known. On a real deployment that is a
+  // hole, so this script refuses outright; the build also leaves it out of the production image (tsconfig.build.json).
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('db:seed:demo creates accounts with a known password and must never run in production');
+  }
   initSupertokens();
   const tenant = await tenancyService.resolveBySlug(env.SEED_TENANT_SLUG);
   console.log(`Seeding "${tenant.slug}"`);

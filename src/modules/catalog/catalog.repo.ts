@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNull, ne, sql } from 'drizzle-orm';
+import { and, asc, eq, ilike, inArray, isNull, ne, or, sql } from 'drizzle-orm';
 import type { Transaction } from '../../db/client.js';
 import {
   categories,
@@ -76,13 +76,13 @@ export async function softDeleteCategory(tx: Transaction, id: string): Promise<b
   return rows.length > 0;
 }
 
-// Products of a deleted category become uncategorised rather than pointing
-// at a category that no longer shows up anywhere.
-export async function clearCategoryFromProducts(tx: Transaction, categoryId: string): Promise<void> {
-  await tx
-    .update(products)
-    .set({ categoryId: null, updatedAt: new Date() })
-    .where(eq(products.categoryId, categoryId));
+// How many (not deleted) products still sit in a category: a category with products cannot be deleted.
+export async function countProductsInCategory(tx: Transaction, categoryId: string): Promise<number> {
+  const [row] = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(products)
+    .where(and(eq(products.categoryId, categoryId), isNull(products.deletedAt)));
+  return row?.n ?? 0;
 }
 
 export async function setCategorySortOrder(tx: Transaction, id: string, sortOrder: number): Promise<boolean> {
@@ -146,9 +146,14 @@ export async function slugExists(tx: Transaction, slug: string, excludeId?: stri
   return row !== undefined;
 }
 
-export async function listProducts(
+const likePattern = (text: string) => `%${text.replace(/[\\%_]/g, (c) => '\\' + c)}%`;
+
+// Products in the owner's order (sort_order, then id to break ties), one page at a time: `after` is the
+// [sort_order, id] of the last product already shown.
+export async function pageProducts(
   tx: Transaction,
-  filter: { categoryId?: string; active?: boolean } = {},
+  filter: { categoryId?: string; active?: boolean; q?: string },
+  page: { limit: number; after?: [number, string] },
 ): Promise<Product[]> {
   const conditions = [isNull(products.deletedAt)];
   if (filter.categoryId) {
@@ -157,11 +162,20 @@ export async function listProducts(
   if (filter.active !== undefined) {
     conditions.push(eq(products.active, filter.active));
   }
+  if (filter.q) {
+    const pattern = likePattern(filter.q);
+    const match = or(ilike(products.nameEs, pattern), ilike(products.nameEn, pattern), ilike(products.slug, pattern));
+    if (match) conditions.push(match);
+  }
+  if (page.after) {
+    conditions.push(sql`(${products.sortOrder}, ${products.id}) > (${page.after[0]}::int, ${page.after[1]}::uuid)`);
+  }
   return tx
     .select()
     .from(products)
     .where(and(...conditions))
-    .orderBy(asc(products.sortOrder), asc(products.createdAt));
+    .orderBy(asc(products.sortOrder), asc(products.id))
+    .limit(page.limit);
 }
 
 export async function nextProductSortOrder(tx: Transaction): Promise<number> {
@@ -202,4 +216,17 @@ export async function setProductSortOrder(tx: Transaction, id: string, sortOrder
     .where(and(eq(products.id, id), isNull(products.deletedAt)))
     .returning({ id: products.id });
   return rows.length > 0;
+}
+
+// Numbers for the owner's product screen, counted by the database (the screen only holds a page of the list).
+export async function summarizeProducts(tx: Transaction): Promise<{ total: number; live: number; lowStock: number }> {
+  const [row] = await tx
+    .select({
+      total: sql<number>`count(*)::int`,
+      live: sql<number>`count(*) filter (where ${products.active})::int`,
+      lowStock: sql<number>`count(*) filter (where ${products.stockStatus} <> 'available')::int`,
+    })
+    .from(products)
+    .where(isNull(products.deletedAt));
+  return { total: row?.total ?? 0, live: row?.live ?? 0, lowStock: row?.lowStock ?? 0 };
 }

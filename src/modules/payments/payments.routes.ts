@@ -1,16 +1,77 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { NotFoundError } from '../../core/errors.js';
+import { requireAuth, requireRole } from '../../core/middleware/auth.middleware.js';
 import { resolveTenant } from '../../core/middleware/tenant.middleware.js';
-import { providerNameSchema } from './payments.schema.js';
+import { validate } from '../../core/middleware/validate.middleware.js';
+import { requireParam } from '../../core/request.js';
+import {
+  createManualMethodSchema,
+  methodIdParamSchema,
+  providerNameSchema,
+  reorderMethodsSchema,
+  updateManualMethodSchema,
+} from './payments.schema.js';
 import { paymentsService } from './payments.service.js';
 
 export const paymentsRouter = Router();
 
 // Which ways of paying this store offers, for the checkout to draw its choices. Public. The account
 // details themselves are not here: they are shown only to the buyer of an order (orders module).
-paymentsRouter.get('/methods', resolveTenant, (_req, res) => {
-  res.json({ card: true, manual: paymentsService.listManualMethods(0).map((m) => ({ method: m.method, label: m.label })) });
+paymentsRouter.get('/methods', resolveTenant, async (req, res, next) => {
+  try {
+    const manual = await paymentsService.listManualMethods(req.tenantId, 0);
+    res.json({ card: paymentsService.isCardEnabled(), manual: manual.map((m) => ({ id: m.id, kind: m.kind, label: m.label })) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The owner's Settings → Payments: the accounts buyers can send money to. Admin only: these are the store's
+// payment details, and what a buyer is told to pay.
+const adminOnly = [resolveTenant, requireAuth, requireRole('admin')];
+
+paymentsRouter.get('/admin/methods', ...adminOnly, async (req, res, next) => {
+  try {
+    res.json(await paymentsService.listMethodsForAdmin(req.tenantId));
+  } catch (err) {
+    next(err);
+  }
+});
+
+paymentsRouter.post('/methods', ...adminOnly, validate({ body: createManualMethodSchema }), async (req, res, next) => {
+  try {
+    res.status(201).json(await paymentsService.createManualMethod(req.tenantId, req.body));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Declared before '/methods/:id' so "order" is never read as an id.
+paymentsRouter.put('/methods/order', ...adminOnly, validate({ body: reorderMethodsSchema }), async (req, res, next) => {
+  try {
+    await paymentsService.reorderManualMethods(req.tenantId, req.body.ids);
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
+});
+
+paymentsRouter.patch('/methods/:id', ...adminOnly, validate({ params: methodIdParamSchema, body: updateManualMethodSchema }), async (req, res, next) => {
+  try {
+    res.json(await paymentsService.updateManualMethod(req.tenantId, requireParam(req, 'id'), req.body));
+  } catch (err) {
+    next(err);
+  }
+});
+
+paymentsRouter.delete('/methods/:id', ...adminOnly, validate({ params: methodIdParamSchema }), async (req, res, next) => {
+  try {
+    await paymentsService.deleteManualMethod(req.tenantId, requireParam(req, 'id'));
+    res.status(204).send();
+  } catch (err) {
+    next(err);
+  }
 });
 
 const providerParamSchema = z.object({ provider: providerNameSchema });

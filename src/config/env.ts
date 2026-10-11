@@ -55,6 +55,11 @@ const envSchema = z.object({
   // Bearer token for GET /metrics. In production the endpoint is off without one.
   METRICS_TOKEN: z.string().min(16).optional(),
 
+  // The session cookie's domain. Leave unset in development (localhost). In production, when the web app is on
+  // example.com and the API on api.example.com, set it to ".example.com": without it the browser keeps the cookie
+  // on the API host only, sign-in answers OK, and every call after it is a 401.
+  COOKIE_DOMAIN: optionalText,
+
   SUPERTOKENS_CONNECTION_URI: z.string().url(),
   SUPERTOKENS_API_KEY: z.string().optional(),
 
@@ -62,12 +67,20 @@ const envSchema = z.object({
   // means store creation over HTTP is disabled; the seed script needs no key.
   PLATFORM_API_KEY: z.string().min(32).optional(),
 
+  // Sign in with Google. Both or neither: with neither, the feature is simply off (development, tests).
+  GOOGLE_CLIENT_ID: optionalText,
+  GOOGLE_CLIENT_SECRET: optionalText,
+
   RESEND_API_KEY: z.string().min(1),
   EMAIL_FROM: z.string().min(1).default('onboarding@resend.dev'),
   // Really send emails through Resend? Unset = only in production; elsewhere the message is just logged.
   // Set `true` to try the real emails in development (with the default sender, Resend only delivers
   // to the address your Resend account was registered with).
   SEND_EMAILS: z.enum(['true', 'false']).optional(),
+
+  // Error monitoring (Sentry, or GlitchTip self-hosted: same protocol). Unset = nothing is sent.
+  SENTRY_DSN: optionalText,
+  SENTRY_ENVIRONMENT: optionalText,
 
   // Where buyers send money for the manual transfer option (Zelle / Cash App / PayPal). A method is
   // offered only when its account is set; blank counts as unset. See docs/API.md section 9b.

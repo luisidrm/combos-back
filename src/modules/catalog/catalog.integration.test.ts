@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
 import { startTestDatabase, type TestDatabase } from '../../db/testing/test-database.js';
 import type { mediaService as mediaServiceType } from '../media/index.js';
+import { createProductSchema, updateProductSchema } from './catalog.schema.js';
 import type { catalogService as catalogServiceType } from './index.js';
 
 // The event bus is Redis-backed; nothing here needs a real queue, and the
@@ -47,7 +48,10 @@ describe('catalog module', () => {
     return row.id;
   }
 
+  // Tenant A's own category, created once in beforeAll: every product needs one.
+  let categoryAId: string;
   const product = (name: string, overrides: Record<string, unknown> = {}) => ({
+    categoryId: categoryAId,
     nameEs: name,
     priceCents: 1250,
     unitLabel: '1 lb',
@@ -59,6 +63,7 @@ describe('catalog module', () => {
     adminSql = database.adminSql;
 
     catalog = (await import('./index.js')).catalogService;
+    categoryAId = (await catalog.createCategory(tenantA, { nameEs: 'General' })).id;
     mediaService = (await import('../media/index.js')).mediaService;
     emitMock = vi.mocked((await import('../../core/events.js')).events.emit);
   });
@@ -83,8 +88,9 @@ describe('catalog module', () => {
     });
 
     it('returns nothing when tenant A reads a category that belongs to tenant B', async () => {
-      expect(await catalog.listCategoriesForAdmin(tenantA)).toEqual([]);
-      expect(await catalog.listPublicCategories(tenantA)).toEqual([]);
+      // Tenant A has only its own category (made in beforeAll); tenant B's "Carnes" is nowhere in sight.
+      expect((await catalog.listCategoriesForAdmin(tenantA)).map((c) => c.id)).toEqual([categoryAId]);
+      expect((await catalog.listPublicCategories(tenantA)).map((c) => c.id)).toEqual([categoryAId]);
     });
 
     it("lets tenant B read its own rows (so the checks above aren't vacuous)", async () => {
@@ -136,7 +142,8 @@ describe('catalog module', () => {
 
     it('lets the same slug exist in two tenants', async () => {
       const inA = await catalog.createProduct(tenantA, product('Aceite'));
-      const inB = await catalog.createProduct(tenantB, product('Aceite'));
+      const categoryB = await catalog.createCategory(tenantB, { nameEs: 'Despensa B' });
+      const inB = await catalog.createProduct(tenantB, product('Aceite', { categoryId: categoryB.id }));
       expect(inA.slug).toBe('aceite');
       expect(inB.slug).toBe('aceite');
     });
@@ -299,8 +306,16 @@ describe('catalog module', () => {
       const category = await catalog.createCategory(tenantA, { nameEs: 'Temporal', nameEn: 'Temporary' });
       const filed = await catalog.createProduct(tenantA, product('Archivado', { categoryId: category.id }));
 
+      // A category with products cannot go: every product must have one.
+      await expect(catalog.deleteCategory(tenantA, category.id)).rejects.toMatchObject({
+        httpStatus: 409,
+        details: { reason: 'CATEGORY_IN_USE', productCount: 1 },
+      });
+      expect((await catalog.getProductForAdmin(tenantA, filed.id)).categoryId).toBe(category.id);
+
+      // Once the product has moved on, it can.
+      await catalog.updateProduct(tenantA, filed.id, { categoryId: categoryAId });
       await catalog.deleteCategory(tenantA, category.id);
-      expect((await catalog.getProductForAdmin(tenantA, filed.id)).categoryId).toBeNull();
       expect((await catalog.listCategoriesForAdmin(tenantA)).map((c) => c.id)).not.toContain(category.id);
     });
 
@@ -323,6 +338,158 @@ describe('catalog module', () => {
       const snapshots = await catalog.getProductSnapshots(tenantA, [wanted.id, crypto.randomUUID()]);
       expect(snapshots).toHaveLength(1);
       expect(snapshots[0]).toMatchObject({ id: wanted.id, priceCents: 4321, unitLabel: '1 lb', active: false });
+    });
+  });
+
+  // The owner's rule: a product always has a category.
+  describe('every product has a category', () => {
+    const base = { nameEs: 'Sin categoría', priceCents: 500, unitLabel: '1 lb' };
+
+    it('is required to create a product and can never be cleared by an edit', () => {
+      expect(createProductSchema.safeParse(base).success).toBe(false);
+      expect(createProductSchema.safeParse({ ...base, categoryId: null }).success).toBe(false);
+      expect(updateProductSchema.safeParse({ categoryId: null }).success).toBe(false);
+      // Editing something else, without mentioning the category, is fine.
+      expect(updateProductSchema.safeParse({ priceCents: 700 }).success).toBe(true);
+    });
+
+    it('rejects a category that does not exist', async () => {
+      await expect(catalog.createProduct(tenantA, product('Fantasma', { categoryId: crypto.randomUUID() }))).rejects.toBeInstanceOf(
+        NotFoundError,
+      );
+    });
+
+    // Products from before the rule have no category. Insert one directly, the way old data looks.
+    async function legacyProduct(name: string): Promise<string> {
+      const [row] = await adminSql<{ id: string }[]>`
+        INSERT INTO products (tenant_id, slug, name_es, name_en, price_cents, unit_label, sort_order, active)
+        VALUES (${tenantA}, ${'legacy-' + crypto.randomUUID()}, ${name}, ${name}, 900, '1 lb', 9999, false)
+        RETURNING id
+      `;
+      if (!row) throw new Error('insert into products returned no row');
+      return row.id;
+    }
+
+    it('lets a product without one change its stock, but any other edit has to give it one', async () => {
+      const id = await legacyProduct('Heredado');
+      expect((await catalog.updateProduct(tenantA, id, { stockStatus: 'limited' })).stockStatus).toBe('limited');
+
+      await expect(catalog.updateProduct(tenantA, id, { priceCents: 950 })).rejects.toMatchObject({
+        httpStatus: 400,
+        details: { reason: 'CATEGORY_REQUIRED' },
+      });
+      const fixed = await catalog.updateProduct(tenantA, id, { priceCents: 950, categoryId: categoryAId });
+      expect(fixed).toMatchObject({ priceCents: 950, categoryId: categoryAId });
+    });
+
+    it('will not make a product without one visible', async () => {
+      const id = await legacyProduct('Heredado visible');
+      await insertPicture(tenantA, id);
+      await expect(catalog.activateProduct(tenantA, id)).rejects.toMatchObject({
+        httpStatus: 409,
+        details: { reason: 'CATEGORY_REQUIRED' },
+      });
+
+      await catalog.updateProduct(tenantA, id, { categoryId: categoryAId });
+      expect((await catalog.activateProduct(tenantA, id)).active).toBe(true);
+    });
+  });
+
+  // Both product lists are served a page at a time, in the owner's order. The oracle is a plain query.
+  describe('paged product lists', () => {
+    async function liveProduct(name: string, overrides: Record<string, unknown> = {}) {
+      const created = await catalog.createProduct(tenantA, product(name, overrides));
+      await insertPicture(tenantA, created.id);
+      await catalog.activateProduct(tenantA, created.id);
+      return created;
+    }
+
+    const oracle = async (where: 'public' | 'admin') =>
+      (
+        await adminSql<{ id: string }[]>`
+          select id from products
+          where tenant_id = ${tenantA} and deleted_at is null ${where === 'public' ? adminSql`and active` : adminSql``}
+          order by sort_order, id`
+      ).map((row) => row.id);
+
+    async function walkPublic(limit: number) {
+      const pages: string[][] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await catalog.pagePublicProducts(tenantA, {}, { limit, cursor });
+        pages.push(page.items.map((p) => p.id));
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      return pages;
+    }
+
+    it('serves the live products in the owner\'s order, every one exactly once', async () => {
+      for (let i = 0; i < 5; i += 1) await liveProduct('Paged Live ' + i);
+      const pages = await walkPublic(2);
+      expect(pages.every((page) => page.length > 0 && page.length <= 2)).toBe(true);
+      expect(pages.flat()).toEqual(await oracle('public'));
+      expect(new Set(pages.flat()).size).toBe(pages.flat().length);
+    });
+
+    it('keeps drafts out of the shop window but shows them to the owner, who can search', async () => {
+      const draft = await catalog.createProduct(tenantA, product('Paged Borrador Único', { nameEn: 'Paged Unique Draft' }));
+      expect((await walkPublic(3)).flat()).not.toContain(draft.id);
+
+      const found = async (q: string) => (await catalog.pageProductsForAdmin(tenantA, { q }, { limit: 50 })).items.map((p) => p.id);
+      expect(await found('BORRADOR')).toContain(draft.id); // Spanish name, any case
+      expect(await found('Único')).toContain(draft.id); // with its accent
+      expect(await found('UNIQUE DRAFT')).toContain(draft.id); // English name
+      expect(await found('paged-borrador')).toContain(draft.id); // slug
+      expect(await found('no-such-product-anywhere')).toEqual([]);
+      expect(await found('%')).toEqual([]); // a % is a plain character, not a wildcard
+    });
+
+    it('serves the owner\'s whole list, drafts included, in the same order', async () => {
+      const walked: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await catalog.pageProductsForAdmin(tenantA, {}, { limit: 4, cursor });
+        expect(page.items.every((p) => 'cover' in p)).toBe(true);
+        walked.push(...page.items.map((p) => p.id));
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      expect(walked).toEqual(await oracle('admin'));
+    });
+
+    it('a category filter applies to every page', async () => {
+      const own = await catalog.createCategory(tenantA, { nameEs: 'Paged Categoría' });
+      for (let i = 0; i < 3; i += 1) await liveProduct('Paged Cat ' + i, { categoryId: own.id });
+      const ids: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await catalog.pagePublicProducts(tenantA, { categoryId: own.id }, { limit: 2, cursor });
+        expect(page.items.every((p) => p.categoryId === own.id)).toBe(true);
+        ids.push(...page.items.map((p) => p.id));
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      expect(ids).toHaveLength(3);
+    });
+
+    it('counts total, live and low-stock products in the database, for the badges on the screen', async () => {
+      const summary = await catalog.summarizeProductsForAdmin(tenantA);
+      const [row] = await adminSql<{ total: number; live: number; low: number }[]>`
+        select count(*)::int total, count(*) filter (where active)::int live, count(*) filter (where stock_status <> 'available')::int low
+        from products where tenant_id = ${tenantA} and deleted_at is null`;
+      expect(summary).toEqual({ total: row?.total, live: row?.live, lowStock: row?.low });
+    });
+
+    it('refuses a cursor that was not made by this server, instead of failing inside the database', async () => {
+      const forged = [
+        'garbage',
+        Buffer.from(JSON.stringify(['x'])).toString('base64url'),
+        Buffer.from(JSON.stringify(['not-a-number', crypto.randomUUID()])).toString('base64url'),
+        Buffer.from(JSON.stringify([1.5, crypto.randomUUID()])).toString('base64url'),
+        Buffer.from(JSON.stringify([1, 'not-a-uuid'])).toString('base64url'),
+      ];
+      for (const cursor of forged) {
+        await expect(catalog.pagePublicProducts(tenantA, {}, { limit: 5, cursor }), cursor).rejects.toMatchObject({ httpStatus: 400 });
+        await expect(catalog.pageProductsForAdmin(tenantA, {}, { limit: 5, cursor }), cursor).rejects.toMatchObject({ httpStatus: 400 });
+      }
     });
   });
 });

@@ -1,0 +1,235 @@
+# Production stack for one VPS (InterServer): everything private on an internal network, only Caddy published.
+#
+#   cd deploy && cp .env.production.example .env.production   # then fill it in (see the comments there)
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d --build
+#
+# The folders `back/` and `front/` must sit side by side (as they do in the repository), because the web image
+# is built from ../../front. Nothing here is published to the host except ports 80/443 of Caddy.
+name: combo-shop
+
+# Container logs rotate, so a small disk is never filled by them.
+x-logging: &logging
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+# What the API and the worker see. Deliberately explicit (not the whole env file): they connect as the restricted
+# database role and never receive the superuser password, which only the one-off migrate job below gets.
+x-app-env: &app-env
+  environment:
+    NODE_ENV: production
+    PORT: 4000
+    APP_BASE_URL: https://${API_DOMAIN}
+    WEB_BASE_URL: https://${SITE_DOMAIN}
+    COOKIE_DOMAIN: ${COOKIE_DOMAIN}
+    DATABASE_URL: postgres://combo_shop_app:${APP_DB_PASSWORD}@db:5432/combo_shop
+    DATABASE_POOL_MAX: 10
+    REDIS_URL: redis://redis:6379
+    MINIO_ENDPOINT: minio
+    MINIO_PORT: 9000
+    MINIO_USE_SSL: "false"
+    MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+    MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    MINIO_BUCKET: ${MINIO_BUCKET}
+    # How browsers reach MinIO: through Caddy on the media domain.
+    MINIO_PUBLIC_ENDPOINT: ${MEDIA_DOMAIN}
+    MINIO_PUBLIC_PORT: 443
+    MINIO_PUBLIC_USE_SSL: "true"
+    MEDIA_PUBLIC_BASE_URL: https://${MEDIA_DOMAIN}/${MINIO_BUCKET}
+    TRUST_PROXY_HOPS: 2
+    METRICS_TOKEN: ${METRICS_TOKEN:-}
+    SUPERTOKENS_CONNECTION_URI: http://supertokens:3567
+    SUPERTOKENS_API_KEY: ${SUPERTOKENS_API_KEY}
+    PLATFORM_API_KEY: ${PLATFORM_API_KEY:-}
+    RESEND_API_KEY: ${RESEND_API_KEY}
+    EMAIL_FROM: ${EMAIL_FROM}
+    SEND_EMAILS: "true"
+    SENTRY_DSN: ${SENTRY_DSN:-}
+    SENTRY_ENVIRONMENT: production
+    # Sign in with Google: on only when both are set (buyers only; staff keep email + password).
+    GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+    GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  db:
+    image: postgres:16-alpine
+    <<: *logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: combo_shop
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d combo_shop"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    <<: *logging
+    restart: unless-stopped
+    # Append-only file: queued emails and picture jobs survive a restart.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    <<: *logging
+    restart: unless-stopped
+    command: ["server", "/data"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+
+  supertokens:
+    image: registry.supertokens.io/supertokens/supertokens-postgresql:12.0.7
+    <<: *logging
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      POSTGRESQL_CONNECTION_URI: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/supertokens
+      API_KEYS: ${SUPERTOKENS_API_KEY}
+
+  # One-off: applies the SQL migrations as the database owner, then exits. The API waits for it to finish.
+  migrate:
+    build: ..
+    image: combo-shop-api:${RELEASE:-latest}
+    environment:
+      DATABASE_ADMIN_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/combo_shop
+    command: ["node", "dist/db/migrate.js"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # One-off jobs, run by hand after the first start (see docs/DEPLOY-PLAN.md): the provinces and municipalities, then the
+  # store and its first admin from deploy/.env.production.seed (never committed). Both are safe to run again.
+  #   docker compose --env-file .env.production -f docker-compose.prod.yml --profile seed run --rm seed-geo
+  #   docker compose --env-file .env.production -f docker-compose.prod.yml --profile seed run --rm seed-admin
+  seed-geo:
+    image: combo-shop-api:${RELEASE:-latest}
+    <<: *app-env
+    command: ["node", "dist/db/seed/geo.seed.js"]
+    profiles: ["seed"]
+    restart: "no"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  seed-admin:
+    image: combo-shop-api:${RELEASE:-latest}
+    <<: *app-env
+    env_file: .env.production.seed
+    command: ["node", "dist/db/seed/admin.seed.js"]
+    profiles: ["seed"]
+    restart: "no"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    image: combo-shop-api:${RELEASE:-latest}
+    <<: *app-env
+    restart: unless-stopped
+    init: true
+    command: ["node", "dist/main.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      supertokens:
+        condition: service_started
+      minio:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Same image, other command: thumbnails, email, the maintenance pass. /ready on the API reports "worker: ok|down".
+  worker:
+    image: combo-shop-api:${RELEASE:-latest}
+    <<: *app-env
+    restart: unless-stopped
+    init: true
+    command: ["node", "dist/worker.js"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ../../front
+      args:
+        # Baked into the browser bundle at build time: one build per environment.
+        NEXT_PUBLIC_API_BASE_URL: https://${API_DOMAIN}
+        NEXT_PUBLIC_SITE_URL: https://${SITE_DOMAIN}
+        NEXT_PUBLIC_TENANT_SLUG: ${TENANT_SLUG}
+        NEXT_PUBLIC_MEDIA_HOSTNAME: ${MEDIA_DOMAIN}
+        NEXT_PUBLIC_SENTRY_DSN: ${WEB_SENTRY_DSN:-}
+        # Shows the "Continue with Google" button. Set to true only when the API has the Google keys.
+        NEXT_PUBLIC_GOOGLE_SIGNIN: ${WEB_GOOGLE_SIGNIN:-false}
+    image: combo-shop-web:${RELEASE:-latest}
+    <<: *logging
+    restart: unless-stopped
+    init: true
+    environment:
+      # Server-side (RSC) calls to the API go over the internal network, not through Cloudflare.
+      INTERNAL_API_BASE_URL: http://api:4000
+    depends_on:
+      api:
+        condition: service_healthy
+
+  caddy:
+    image: caddy:2-alpine
+    <<: *logging
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+      API_DOMAIN: ${API_DOMAIN}
+      MEDIA_DOMAIN: ${MEDIA_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+      - minio
+
+volumes:
+  db_data:
+  redis_data:
+  minio_data:
+  caddy_data:
+  caddy_config:

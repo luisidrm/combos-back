@@ -2,6 +2,7 @@ import type { NextFunction, Request, Response } from 'express';
 import { isUniqueViolation } from '../../db/errors.js';
 import { AppError, NotFoundError, TooManyRequestsError } from '../errors.js';
 import { logger } from '../logger.js';
+import { reportError } from '../monitoring.js';
 import { getRequestId } from '../request-context.js';
 
 interface ErrorBody {
@@ -80,5 +81,6 @@ export function errorHandler(err: unknown, req: Request, res: Response, next: Ne
   }
 
   logger.error({ err, path: req.path }, 'Unhandled error');
+  reportError(err, { method: req.method, path: req.path });
   send(res, 500, 'INTERNAL_ERROR', 'Something went wrong');
 }

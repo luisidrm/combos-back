@@ -2,6 +2,7 @@ import { sql } from 'drizzle-orm';
 import type postgres from 'postgres';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { defaultCategory } from '../../db/testing/default-category.js';
 import { startTestDatabase, type TestDatabase } from '../../db/testing/test-database.js';
 import type { cartService as cartServiceType } from '../cart/index.js';
 import type { catalogService as catalogServiceType } from '../catalog/index.js';
@@ -71,6 +72,7 @@ describe('orders module: the address book', () => {
 
   beforeAll(async () => {
     // The config reads the environment once, on first import: set the manual transfer accounts first.
+    process.env.SEND_EMAILS = 'false'; // a developer's .env may have real sending on; tests must never email
     process.env.ZELLE_EMAIL = 'pay@example.com';
     process.env.PAYPAL_EMAIL = 'pay@example.com';
     process.env.PAYPAL_ME_HANDLE = 'teststore';
@@ -307,7 +309,7 @@ describe('orders module: the address book', () => {
 
   describe('pricing a checkout (quote)', () => {
     async function liveProduct(name: string, priceCents: number, stockStatus: 'available' | 'out' = 'available') {
-      const product = await catalog.createProduct(tenantA, { nameEs: name, priceCents, unitLabel: '1 lb', stockStatus });
+      const product = await catalog.createProduct(tenantA, { categoryId: await defaultCategory(catalog, tenantA), nameEs: name, priceCents, unitLabel: '1 lb', stockStatus });
       const key = `public/${tenantA}/product/${product.id}/${crypto.randomUUID()}`;
       await adminSql`
         INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
@@ -456,7 +458,7 @@ describe('orders module: the address book', () => {
     const adminUser = crypto.randomUUID();
 
     async function liveProduct(name: string, priceCents: number, overrides: Record<string, unknown> = {}) {
-      const product = await catalog.createProduct(tenantA, { nameEs: name, priceCents, unitLabel: '1 lb', ...overrides });
+      const product = await catalog.createProduct(tenantA, { categoryId: await defaultCategory(catalog, tenantA), nameEs: name, priceCents, unitLabel: '1 lb', ...overrides });
       const key = `public/${tenantA}/product/${product.id}/${crypto.randomUUID()}`;
       await adminSql`
         INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
@@ -578,6 +580,218 @@ describe('orders module: the address book', () => {
       });
     });
 
+    // The same checkout attempt sent twice must never become two orders (a double click, a retry after a dropped
+    // connection, a refresh).
+    describe('a checkout attempt sent more than once', () => {
+      it('returns the order the first attempt made, and charges nothing twice', async () => {
+        const arroz = await liveProduct('Idem Arroz', 950);
+        const { buyer, recipientId, addressId } = await buyerWithCart(arroz.id);
+        const key = 'attempt-' + crypto.randomUUID();
+        const first = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: key });
+        // the cart is empty now, so a second attempt that really tried to place an order would be refused
+        const again = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: key });
+
+        expect(again.order.id).toBe(first.order.id);
+        expect(again.order.orderNumber).toBe(first.order.orderNumber);
+        const [row] = await adminSql<{ n: number }[]>`select count(*)::int n from orders where checkout_key = ${key}`;
+        expect(row?.n).toBe(1);
+        const [paid] = await adminSql<{ payments: number }[]>`select count(*)::int payments from payments where order_id = ${first.order.id}`;
+        expect(paid?.payments).toBe(1);
+      });
+
+      it('makes exactly one order when two identical requests arrive at the same moment', async () => {
+        const arroz = await liveProduct('Idem Race', 950);
+        const { buyer, recipientId, addressId } = await buyerWithCart(arroz.id);
+        const key = 'race-' + crypto.randomUUID();
+        const attempts = await Promise.allSettled([
+          orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: key }),
+          orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: key }),
+          orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: key }),
+        ]);
+        const ids = new Set(attempts.flatMap((a) => (a.status === 'fulfilled' ? [a.value.order.id] : [])));
+        // Whatever the timing, nobody ends up with two orders: either all calls return the one order, or the
+        // late ones are refused because the cart was already emptied.
+        expect(ids.size).toBe(1);
+        const [row] = await adminSql<{ n: number }[]>`select count(*)::int n from orders where checkout_key = ${key}`;
+        expect(row?.n).toBe(1);
+      });
+
+      it('treats a different key as a different attempt', async () => {
+        const arroz = await liveProduct('Idem Two', 950);
+        const { buyer, recipientId, addressId } = await buyerWithCart(arroz.id);
+        const first = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: 'first-' + crypto.randomUUID() });
+        await cart.addItem(tenantA, { userId: buyer }, { productId: arroz.id, quantity: 1 });
+        const second = await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual', idempotencyKey: 'second-' + crypto.randomUUID() });
+        expect(second.order.id).not.toBe(first.order.id);
+      });
+
+      it("never hands one buyer another buyer's order, even with the same key", async () => {
+        const arroz = await liveProduct('Idem Other Buyer', 950);
+        const one = await buyerWithCart(arroz.id);
+        const two = await buyerWithCart(arroz.id);
+        const key = 'shared-key-' + crypto.randomUUID();
+        const a = await orders.checkout(tenantA, one.buyer, { recipientId: one.recipientId, addressId: one.addressId, provider: 'manual', idempotencyKey: key });
+        const b = await orders.checkout(tenantA, two.buyer, { recipientId: two.recipientId, addressId: two.addressId, provider: 'manual', idempotencyKey: key });
+        expect(b.order.id).not.toBe(a.order.id);
+      });
+
+      it('still works without a key (older clients)', async () => {
+        const arroz = await liveProduct('Idem No Key', 950);
+        const { order } = await checkoutAs('manual', arroz.id);
+        expect(order.status).toBe('pending_payment');
+      });
+    });
+
+    // Lists are served a page at a time. The oracle for "right" is the database itself: a plain query in the order the
+    // API promises (newest first, ties broken by id).
+    describe('paged lists', () => {
+      const idsFor = async (buyer: string) =>
+        (await adminSql<{ id: string }[]>`select id from orders where buyer_user_id = ${buyer} order by created_at desc, id desc`).map((r) => r.id);
+
+      async function buyerWithOrders(count: number) {
+        const product = await liveProduct('Paged ' + crypto.randomUUID().slice(0, 6), 500);
+        const { buyer, recipientId, addressId } = await buyerWithCart(product.id);
+        for (let i = 0; i < count; i += 1) {
+          if (i > 0) await cart.addItem(tenantA, { userId: buyer }, { productId: product.id, quantity: 1 });
+          await orders.checkout(tenantA, buyer, { recipientId, addressId, provider: 'manual' });
+        }
+        return buyer;
+      }
+
+      async function walk(buyer: string, limit: number) {
+        const pages: string[][] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await orders.pageOrdersForBuyer(tenantA, buyer, { limit, cursor });
+          pages.push(page.items.map((o) => o.id));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        return pages;
+      }
+
+      it("serves a buyer's orders newest first, every one exactly once, with no empty trailing page", async () => {
+        const buyer = await buyerWithOrders(5);
+        const pages = await walk(buyer, 2);
+        expect(pages.map((page) => page.length)).toEqual([2, 2, 1]);
+        expect(pages.flat()).toEqual(await idsFor(buyer));
+      });
+
+      it('a page that ends exactly at the last order has no next page', async () => {
+        const buyer = await buyerWithOrders(4);
+        expect((await walk(buyer, 4)).length).toBe(1);
+        expect((await walk(buyer, 2)).map((page) => page.length)).toEqual([2, 2]);
+      });
+
+      it('an order that arrives while someone scrolls does not shift the rest of the list', async () => {
+        const buyer = await buyerWithOrders(4);
+        const before = await idsFor(buyer);
+        const first = await orders.pageOrdersForBuyer(tenantA, buyer, { limit: 2 });
+        expect(first.items.map((o) => o.id)).toEqual(before.slice(0, 2));
+
+        // a new order lands on top, then the next page is asked for
+        const product = await liveProduct('Paged Late ' + crypto.randomUUID().slice(0, 6), 500);
+        await cart.addItem(tenantA, { userId: buyer }, { productId: product.id, quantity: 1 });
+        const recipientRow = (await orders.listRecipients(tenantA, buyer))[0];
+        await orders.checkout(tenantA, buyer, { recipientId: recipientRow?.id as string, addressId: recipientRow?.addresses[0]?.id as string, provider: 'manual' });
+
+        const second = await orders.pageOrdersForBuyer(tenantA, buyer, { limit: 2, cursor: first.nextCursor as string });
+        expect(second.items.map((o) => o.id)).toEqual(before.slice(2, 4));
+      });
+
+      it('orders with an identical timestamp are neither skipped nor repeated at a page boundary', async () => {
+        const buyer = await buyerWithOrders(4);
+        await adminSql`update orders set created_at = '2026-01-01 00:00:00.123456+00' where buyer_user_id = ${buyer}`;
+        const pages = await walk(buyer, 1);
+        expect(pages.flat()).toEqual(await idsFor(buyer));
+        expect(new Set(pages.flat()).size).toBe(4);
+      });
+
+      it('refuses a cursor that was not made by this server, instead of failing inside the database', async () => {
+        const buyer = await buyerWithOrders(1);
+        const forged = [
+          'garbage',
+          Buffer.from(JSON.stringify(['x'])).toString('base64url'),
+          Buffer.from(JSON.stringify(['2026-01-01', 'not-a-uuid'])).toString('base64url'),
+          Buffer.from(JSON.stringify(["2026-01-01T00:00:00.000000Z'; drop table orders;--", crypto.randomUUID()])).toString('base64url'),
+        ];
+        for (const cursor of forged) {
+          await expect(orders.pageOrdersForBuyer(tenantA, buyer, { limit: 5, cursor }), cursor).rejects.toMatchObject({ httpStatus: 400 });
+        }
+      });
+
+      it('never shows a buyer another buyer\'s orders', async () => {
+        const mine = await buyerWithOrders(2);
+        const theirs = await buyerWithOrders(2);
+        const seen = (await walk(mine, 1)).flat();
+        expect(seen.sort()).toEqual((await idsFor(mine)).sort());
+        expect(seen.some((id) => id === undefined)).toBe(false);
+        expect((await idsFor(theirs)).some((id) => seen.includes(id))).toBe(false);
+      });
+
+      it('splits the orders of a buyer into active and past on the server, so a tab never hides orders on an unloaded page', async () => {
+        const buyer = await buyerWithOrders(3);
+        const [newest, middle, oldest] = await idsFor(buyer);
+        await orders.cancelByBuyer(tenantA, buyer, middle as string, 'changed my mind');
+
+        const collect = async (scope: 'active' | 'past') => {
+          const ids: string[] = [];
+          let cursor: string | undefined;
+          do {
+            const page = await orders.pageOrdersForBuyer(tenantA, buyer, { limit: 1, cursor }, scope);
+            ids.push(...page.items.map((o) => o.id));
+            cursor = page.nextCursor ?? undefined;
+          } while (cursor);
+          return ids;
+        };
+        expect(await collect('active')).toEqual([newest, oldest]);
+        expect(await collect('past')).toEqual([middle]);
+      });
+
+      it('serves the admin queue in the same order, a page at a time, and the pages add up to the whole queue', async () => {
+        const everyId = (await adminSql<{ id: string }[]>`select id from orders where tenant_id = ${tenantA} order by created_at desc, id desc`).map((r) => r.id);
+        const walked: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await orders.pageOrdersForAdmin(tenantA, {}, { limit: 7, cursor });
+          expect(page.items.length).toBeLessThanOrEqual(7);
+          walked.push(...page.items.map((o) => o.id));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+        expect(walked).toEqual(everyId);
+      });
+
+      it('filters the queue by status on the server', async () => {
+        const buyer = await buyerWithOrders(2);
+        const [one] = await idsFor(buyer);
+        await orders.adminMarkPaid(tenantA, buyer, one as string);
+        const paid = await orders.pageOrdersForAdmin(tenantA, { status: 'paid' }, { limit: 100 });
+        expect(paid.items.map((o) => o.id)).toContain(one);
+        expect(paid.items.every((o) => o.status === 'paid')).toBe(true);
+      });
+
+      it('searches by order number, by recipient and by buyer, and treats % and _ as plain characters', async () => {
+        const buyer = await buyerWithOrders(1);
+        const [id] = await idsFor(buyer);
+        const [row] = await adminSql<{ order_number: string; email: string }[]>`
+          select o.order_number, u.email from orders o join users u on u.id = o.buyer_user_id where o.id = ${id as string}`;
+        const find = async (q: string) => (await orders.pageOrdersForAdmin(tenantA, { q }, { limit: 100 })).items.map((o) => o.id);
+
+        expect(await find(row?.order_number as string)).toContain(id);
+        expect(await find((row?.email as string).toUpperCase())).toContain(id); // by buyer, any case
+        expect(await find('zzz-nobody-has-this-name')).toEqual([]);
+        // a "%" is not a wildcard: it would otherwise match every order
+        expect(await find('%')).toEqual([]);
+        expect(await find('_')).toEqual([]);
+      });
+
+      it('counts every status in the database, not in what a screen has loaded', async () => {
+        const counts = await orders.adminOrderCounts(tenantA);
+        const rows = await adminSql<{ status: string; n: number }[]>`select status, count(*)::int n from orders where tenant_id = ${tenantA} group by status`;
+        expect(counts.all).toBe(rows.reduce((sum, r) => sum + r.n, 0));
+        expect(counts.byStatus).toEqual(Object.fromEntries(rows.map((r) => [r.status, r.n])));
+      });
+    });
+
     describe('reading orders', () => {
       it('lets a buyer list and read their own orders, newest first', async () => {
         const p = await liveProduct('Checkout Reading', 400);
@@ -685,13 +899,19 @@ describe('orders module: the address book', () => {
           VALUES (${tenantA}, 'payment_proof', ${orderId}, 'o.jpg', 'public/t.webp', 'public/c.webp', 'public/f.webp', ${status})`;
       }
 
+      async function methodId(kind: string): Promise<string> {
+        const found = (await payments.listManualMethods(tenantA, 100)).find((m) => m.kind === kind);
+        if (!found) throw new Error(`no ${kind} method in the test store`);
+        return found.id;
+      }
+
       it('tells the buyer who to pay and exactly how much, with the order number as the reference', async () => {
         const { buyer, order } = await manualOrder('Manual Instructions');
         const info = await orders.getPaymentInstructions(tenantA, buyer, order.id);
         expect(info).toMatchObject({ orderId: order.id, amountCents: 3000, currency: 'USD', reference: order.orderNumber, report: null });
-        const paypal = info?.methods.find((m) => m.method === 'paypal');
+        const paypal = info?.methods.find((m) => m.kind === 'paypal');
         expect(paypal).toMatchObject({ amountInLink: true, link: 'https://www.paypal.com/paypalme/teststore/30.00USD' });
-        expect(info?.methods.map((m) => m.method)).toEqual(expect.arrayContaining(['zelle', 'paypal']));
+        expect(info?.methods.map((m) => m.kind)).toEqual(expect.arrayContaining(['zelle', 'paypal']));
       });
 
       it('has no instructions for a card order, and shows them only to the buyer of that order', async () => {
@@ -705,30 +925,50 @@ describe('orders module: the address book', () => {
 
       it('needs a screenshot before a transfer can be reported', async () => {
         const { buyer, order } = await manualOrder('Manual No Shot');
-        const failed = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'ABC123' }).catch((e: unknown) => e);
+        const failed = await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('zelle'), transferReference: 'ABC123' }).catch((e: unknown) => e);
         expect((failed as ConflictError).details).toMatchObject({ reason: 'SCREENSHOT_REQUIRED' });
 
         await addScreenshot(order.id, 'failed'); // a failed upload does not count
-        const stillFailed = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'ABC123' }).catch((e: unknown) => e);
+        const stillFailed = await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('zelle'), transferReference: 'ABC123' }).catch((e: unknown) => e);
         expect((stillFailed as ConflictError).details).toMatchObject({ reason: 'SCREENSHOT_REQUIRED' });
+      });
+
+      it('the "transfers to check" filter and its count agree, and exclude orders nobody reported', async () => {
+        const reported = await manualOrder('Filter Reported');
+        await addScreenshot(reported.order.id);
+        await orders.reportTransfer(tenantA, reported.buyer, reported.order.id, { methodId: await methodId('zelle'), transferReference: 'FILTER1' });
+        const quiet = await manualOrder('Filter Quiet');
+
+        const all: string[] = [];
+        let cursor: string | undefined;
+        do {
+          const page = await orders.pageOrdersForAdmin(tenantA, { filter: 'transfer' }, { limit: 3, cursor });
+          expect(page.items.every((o) => o.transferReported && o.status === 'pending_payment')).toBe(true);
+          all.push(...page.items.map((o) => o.id));
+          cursor = page.nextCursor ?? undefined;
+        } while (cursor);
+
+        expect(all).toContain(reported.order.id);
+        expect(all).not.toContain(quiet.order.id);
+        expect((await orders.adminOrderCounts(tenantA)).transfer).toBe(all.length);
       });
 
       it('refuses a method the store does not accept', async () => {
         const { buyer, order } = await manualOrder('Manual Bad Method');
         await addScreenshot(order.id);
-        await expect(orders.reportTransfer(tenantA, buyer, order.id, { method: 'venmo', transferReference: 'ABC123' })).rejects.toBeInstanceOf(ValidationError);
+        await expect(orders.reportTransfer(tenantA, buyer, order.id, { methodId: crypto.randomUUID(), transferReference: 'ABC123' })).rejects.toBeInstanceOf(ValidationError);
       });
 
       it('records the report, flags the order for the admin, and the admin marks it paid', async () => {
         const { buyer, order } = await manualOrder('Manual Report');
         await addScreenshot(order.id);
-        const info = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'paypal', transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
-        expect(info.report).toMatchObject({ method: 'paypal', transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
+        const info = await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('paypal'), transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
+        expect(info.report).toMatchObject({ method: 'PayPal', transferReference: '9XJ12345K', notes: 'sent from my spouse account' });
 
         const row = (await orders.listOrdersForAdmin(tenantA, {})).find((o) => o.id === order.id);
         expect(row?.transferReported).toBe(true);
         const detail = await orders.getOrderForAdmin(tenantA, order.id);
-        expect(detail).toMatchObject({ paymentProvider: 'manual', paymentReport: { method: 'paypal', transferReference: '9XJ12345K' } });
+        expect(detail).toMatchObject({ paymentProvider: 'manual', paymentReport: { method: 'PayPal', transferReference: '9XJ12345K' } });
 
         await orders.adminMarkPaid(tenantA, adminUser, order.id, 'Seen in PayPal');
         const after = (await orders.listOrdersForAdmin(tenantA, {})).find((o) => o.id === order.id);
@@ -738,12 +978,12 @@ describe('orders module: the address book', () => {
       it('keeps the latest report when the buyer corrects it, and refuses once paid', async () => {
         const { buyer, order } = await manualOrder('Manual Correct');
         await addScreenshot(order.id);
-        await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'FIRST1' });
-        await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'SECOND2' });
+        await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('zelle'), transferReference: 'FIRST1' });
+        await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('zelle'), transferReference: 'SECOND2' });
         expect((await orders.getOrderForAdmin(tenantA, order.id)).paymentReport?.transferReference).toBe('SECOND2');
 
         await orders.adminMarkPaid(tenantA, adminUser, order.id);
-        const late = await orders.reportTransfer(tenantA, buyer, order.id, { method: 'zelle', transferReference: 'LATE3' }).catch((e: unknown) => e);
+        const late = await orders.reportTransfer(tenantA, buyer, order.id, { methodId: await methodId('zelle'), transferReference: 'LATE3' }).catch((e: unknown) => e);
         expect((late as ConflictError).details).toMatchObject({ reason: 'NOT_PENDING_PAYMENT' });
       });
     });
@@ -818,6 +1058,394 @@ describe('orders module: the address book', () => {
         const paid = emit.mock.calls.filter(([name]) => name === 'order.status_changed');
         expect(paid).toHaveLength(1);
         expect(paid[0]?.[1]).toMatchObject({ orderId: order.id, tenantId: tenantA, status: 'paid' });
+      });
+    });
+
+    describe('courier dispatch', () => {
+      async function insertCourier(name: string): Promise<{ userId: string; courierId: string }> {
+        const userId = crypto.randomUUID();
+        await adminSql`
+          INSERT INTO users (id, tenant_id, supertokens_user_id, email, full_name, phone, role)
+          VALUES (${userId}, ${tenantA}, ${crypto.randomUUID()}, ${`courier-${userId}@example.com`}, ${name}, '+53 5 5550000', 'courier')`;
+        const { fulfilmentService } = await import('../fulfilment/index.js');
+        const option = (await fulfilmentService.listCouriers(tenantA)).find((c) => c.name === name);
+        if (!option) throw new Error('courier not listed');
+        return { userId, courierId: option.id };
+      }
+
+      async function paidOrder(name: string, prepared: boolean) {
+        const p = await liveProduct(name, 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        if (prepared) await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+        return order;
+      }
+
+      const laneIds = async (lane: 'unassigned' | 'assigned' | 'problems', tenant = tenantA) =>
+        (await (await import('../fulfilment/index.js')).fulfilmentService.pageBoard(tenant, lane, { limit: 100 })).items.map((i) => i.id);
+
+      it('runs the whole process: assign, accept, pick up, deliver', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const courier = await insertCourier('Carlos Courier');
+        const order = await paidOrder('Dispatch Happy', true);
+        expect(await laneIds('unassigned')).toContain(order.id);
+
+        const assignment = await f.assignCourier(tenantA, adminUser, order.id, courier.courierId);
+        expect(assignment).toMatchObject({ status: 'assigned', courierName: 'Carlos Courier' });
+        expect(await laneIds('unassigned')).not.toContain(order.id);
+        expect(await laneIds('assigned')).toContain(order.id);
+        // asking again for the same courier changes nothing
+        expect((await f.assignCourier(tenantA, adminUser, order.id, courier.courierId)).id).toBe(assignment.id);
+
+        const actor = { id: courier.userId, role: 'courier' };
+        expect((await f.accept(tenantA, actor, assignment.id)).status).toBe('accepted');
+        expect((await f.pickUp(tenantA, actor, assignment.id)).status).toBe('picked_up');
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('out_for_delivery');
+
+        const mine = await f.pageMyDeliveries(tenantA, actor, { limit: 30 });
+        expect(mine.items.map((i) => i.id)).toContain(order.id);
+        expect(mine.items.find((i) => i.id === order.id)?.buyer).toBeNull(); // a courier never sees who paid
+
+        const proof = await f.confirmDelivery(tenantA, courier.userId, order.id, { recipientName: 'Rosa' }, 'courier');
+        expect(proof.recipientName).toBe('Rosa');
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('delivered');
+        const history = await f.getOrderAssignments(tenantA, order.id);
+        expect(history.current).toBeNull();
+        expect(history.history[0]).toMatchObject({ status: 'delivered' });
+        const [row] = await adminSql<{ courier_id: string }[]>`SELECT courier_id FROM deliveries WHERE order_id = ${order.id}`;
+        expect(row?.courier_id).toBe(courier.courierId);
+        expect(await f.pageMyDeliveries(tenantA, actor, { limit: 30 })).toMatchObject({ items: expect.not.arrayContaining([expect.objectContaining({ id: order.id })]) });
+      });
+
+      it('refuses to pick up an order that is not prepared yet', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const courier = await insertCourier('Pablo Early');
+        const order = await paidOrder('Dispatch Early', false);
+        const assignment = await f.assignCourier(tenantA, adminUser, order.id, courier.courierId);
+        const failed = await f.pickUp(tenantA, { id: courier.userId, role: 'courier' }, assignment.id).catch((e: unknown) => e);
+        expect((failed as ConflictError).details).toMatchObject({ reason: 'ORDER_NOT_READY' });
+      });
+
+      it('only lets the assigned courier touch the assignment or deliver the order', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const owner = await insertCourier('Owner Courier');
+        const other = await insertCourier('Other Courier');
+        const order = await paidOrder('Dispatch Owner', true);
+        const assignment = await f.assignCourier(tenantA, adminUser, order.id, owner.courierId);
+        const intruder = { id: other.userId, role: 'courier' };
+        const attempts = [
+          () => f.accept(tenantA, intruder, assignment.id),
+          () => f.decline(tenantA, intruder, assignment.id),
+          () => f.pickUp(tenantA, intruder, assignment.id),
+        ];
+        for (const attempt of attempts) {
+          expect(((await attempt().catch((e: unknown) => e)) as { details?: unknown }).details).toMatchObject({ reason: 'NOT_YOUR_DELIVERY' });
+        }
+        await orders.adminMarkOutForDelivery(tenantA, adminUser, order.id);
+        const stolen = await f.confirmDelivery(tenantA, other.userId, order.id, { recipientName: 'X' }, 'courier').catch((e: unknown) => e);
+        expect((stolen as { details?: unknown }).details).toMatchObject({ reason: 'NOT_YOUR_DELIVERY' });
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).status).toBe('out_for_delivery');
+        expect((await f.pageMyDeliveries(tenantA, intruder, { limit: 30 })).items.map((i) => i.id)).not.toContain(order.id);
+      });
+
+      it('reassigning closes the previous assignment, leaving one open', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const first = await insertCourier('First Courier');
+        const second = await insertCourier('Second Courier');
+        const order = await paidOrder('Dispatch Reassign', true);
+        await f.assignCourier(tenantA, adminUser, order.id, first.courierId);
+        const moved = await f.assignCourier(tenantA, adminUser, order.id, second.courierId);
+        const { current, history } = await f.getOrderAssignments(tenantA, order.id);
+        expect(current?.id).toBe(moved.id);
+        expect(history.map((h) => h.status)).toEqual(['assigned', 'released']);
+        await f.releaseAssignment(tenantA, adminUser, order.id);
+        expect((await f.getOrderAssignments(tenantA, order.id)).current).toBeNull();
+        expect(await laneIds('unassigned')).toContain(order.id);
+        const again = await f.releaseAssignment(tenantA, adminUser, order.id).catch((e: unknown) => e);
+        expect(again).toBeInstanceOf(NotFoundError);
+      });
+
+      it('puts a declined or failed delivery in the problems lane until it is given to someone', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const courier = await insertCourier('Problem Courier');
+        const actor = { id: courier.userId, role: 'courier' };
+        const declined = await paidOrder('Dispatch Declined', true);
+        const a1 = await f.assignCourier(tenantA, adminUser, declined.id, courier.courierId);
+        await f.decline(tenantA, actor, a1.id, 'no bike today');
+        expect(await laneIds('problems')).toContain(declined.id);
+        expect(await laneIds('unassigned')).not.toContain(declined.id);
+
+        const failed = await paidOrder('Dispatch Failed', true);
+        const a2 = await f.assignCourier(tenantA, adminUser, failed.id, courier.courierId);
+        await f.pickUp(tenantA, actor, a2.id);
+        await f.fail(tenantA, actor, a2.id, 'recipient_absent', 'nobody home');
+        expect(await laneIds('problems')).toContain(failed.id);
+        expect((await orders.getOrderForAdmin(tenantA, failed.id)).status).toBe('out_for_delivery');
+
+        await f.assignCourier(tenantA, adminUser, failed.id, courier.courierId); // another try
+        expect(await laneIds('problems')).not.toContain(failed.id);
+        expect(await laneIds('assigned')).toContain(failed.id);
+      });
+
+      it('only dispatches paid orders, and keeps one store’s dispatch out of another’s', async () => {
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+        const courier = await insertCourier('Tenant Courier');
+        const p = await liveProduct('Dispatch Unpaid', 700);
+        const { order: unpaid } = await checkoutAs('manual', p.id);
+        const refused = await f.assignCourier(tenantA, adminUser, unpaid.id, courier.courierId).catch((e: unknown) => e);
+        expect((refused as ConflictError).details).toMatchObject({ reason: 'ORDER_NOT_DISPATCHABLE' });
+
+        const order = await paidOrder('Dispatch Tenant', true);
+        await f.assignCourier(tenantA, adminUser, order.id, courier.courierId);
+        expect(await laneIds('assigned', tenantB)).toEqual([]);
+        expect(await f.listCouriers(tenantB)).toEqual([]);
+        const crossed = await f.assignCourier(tenantB, adminUser, order.id, courier.courierId).catch((e: unknown) => e);
+        expect(crossed).toBeInstanceOf(NotFoundError);
+      });
+    });
+
+    describe('sharing an order’s products by link', () => {
+      it('shows the products and nothing about the recipient, address, phone or payment', async () => {
+        const p = await liveProduct('Share Visible', 1250);
+        const { buyer, order } = await checkoutAs('manual', p.id, 3);
+        const { token } = await orders.enableShare(tenantA, buyer, order.id);
+        expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        expect((await orders.enableShare(tenantA, buyer, order.id)).token).toBe(token); // sharing again is the same link
+        expect(await orders.getShare(tenantA, buyer, order.id)).toEqual({ token });
+
+        const shared = await orders.getSharedOrder(tenantA, token);
+        expect(shared).toMatchObject({ orderId: null, orderNumber: null });
+        expect(shared.items).toEqual([expect.objectContaining({ productId: p.id, nameEs: 'Share Visible', quantity: 3, priceCents: 1250, available: true })]);
+
+        const admin = await orders.getOrderForAdmin(tenantA, order.id);
+        const raw = JSON.stringify(shared);
+        for (const secret of [admin.recipientNameSnapshot, admin.recipientPhonesSnapshot, JSON.stringify(admin.addressSnapshot).slice(1, 20), admin.orderNumber, order.id, String(admin.totalCents)]) {
+          expect(raw).not.toContain(secret);
+        }
+      });
+
+      it('tells store staff which order it is, and nobody else', async () => {
+        const p = await liveProduct('Share Staff', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const { token } = await orders.enableShare(tenantA, buyer, order.id);
+        for (const role of ['admin', 'staff']) {
+          expect(await orders.getSharedOrder(tenantA, token, role)).toMatchObject({ orderId: order.id, orderNumber: order.orderNumber });
+        }
+        for (const role of ['buyer', 'courier', undefined]) {
+          expect(await orders.getSharedOrder(tenantA, token, role)).toMatchObject({ orderId: null, orderNumber: null });
+        }
+      });
+
+      it('stops working the moment the buyer switches it off, and a new link is a different one', async () => {
+        const p = await liveProduct('Share Revoke', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const { token } = await orders.enableShare(tenantA, buyer, order.id);
+        await orders.disableShare(tenantA, buyer, order.id);
+        await orders.disableShare(tenantA, buyer, order.id); // harmless twice
+        await expect(orders.getSharedOrder(tenantA, token)).rejects.toBeInstanceOf(NotFoundError);
+        expect(await orders.getShare(tenantA, buyer, order.id)).toEqual({ token: null });
+        expect((await orders.enableShare(tenantA, buyer, order.id)).token).not.toBe(token);
+        await expect(orders.getSharedOrder(tenantA, token)).rejects.toBeInstanceOf(NotFoundError); // the old one stays dead
+      });
+
+      it('lets only the order’s own buyer share it, and only inside its own store', async () => {
+        const p = await liveProduct('Share Owner', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const stranger = await insertBuyer();
+        await expect(orders.enableShare(tenantA, stranger, order.id)).rejects.toBeInstanceOf(NotFoundError);
+        await expect(orders.getShare(tenantA, stranger, order.id)).rejects.toBeInstanceOf(NotFoundError);
+        await expect(orders.disableShare(tenantA, stranger, order.id)).rejects.toBeInstanceOf(NotFoundError);
+
+        const { token } = await orders.enableShare(tenantA, buyer, order.id);
+        await expect(orders.getSharedOrder(tenantB, token)).rejects.toBeInstanceOf(NotFoundError);
+        await expect(orders.getSharedOrder(tenantA, 'x'.repeat(43))).rejects.toBeInstanceOf(NotFoundError);
+      });
+
+      it('shows what can be bought today, not what could be when the order was placed', async () => {
+        const p = await liveProduct('Share Live', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const { token } = await orders.enableShare(tenantA, buyer, order.id);
+        await adminSql`update products set stock_status = 'out' where id = ${p.id}`;
+        expect((await orders.getSharedOrder(tenantA, token)).items[0]).toMatchObject({ productId: p.id, available: false });
+        await adminSql`update products set stock_status = 'available', price_cents = 900 where id = ${p.id}`;
+        expect((await orders.getSharedOrder(tenantA, token)).items[0]).toMatchObject({ available: true, priceCents: 900 });
+        await adminSql`update products set deleted_at = now() where id = ${p.id}`;
+        expect((await orders.getSharedOrder(tenantA, token)).items[0]).toMatchObject({ productId: null, nameEs: 'Share Live', available: false, priceCents: null });
+      });
+    });
+
+    describe('telling the buyer what happened (events for the emails)', () => {
+      const daysAgo = (days: number) => new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      const sent = async () => vi.mocked((await import('../../core/events.js')).events.emit);
+      const announced = async (orderId: string) =>
+        (await sent()).mock.calls.filter(([, payload]) => (payload as { orderId?: string }).orderId === orderId).map(([name, payload]) => ({ name, ...(payload as object) }));
+
+      it('writes to each buyer in their own language: Spanish by default, English once chosen', async () => {
+        const { identityService } = await import('../identity/index.js');
+        const p = await liveProduct('Mail Locale', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).buyer?.locale).toBe('es');
+        await identityService.setLocale(tenantA, buyer, 'en');
+        expect((await orders.getOrderForAdmin(tenantA, order.id)).buyer?.locale).toBe('en');
+
+        // The language picked on the signup form is kept; anything unknown reads Spanish.
+        const signedUp = await identityService.findOrCreateFromSession(tenantA, crypto.randomUUID(), `locale-${crypto.randomUUID()}@example.com`, 'buyer', { locale: 'en' });
+        expect(signedUp.locale).toBe('en');
+        const odd = await identityService.findOrCreateFromSession(tenantA, crypto.randomUUID(), `locale-${crypto.randomUUID()}@example.com`, 'buyer', { locale: 'fr' });
+        expect(odd.locale).toBe('es');
+      });
+
+      it('announces a placed order once', async () => {
+        const p = await liveProduct('Mail Placed', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        const events = (await announced(order.id)).filter((e) => e.name === 'order.status_changed');
+        expect(events).toHaveLength(1);
+        expect(events[0]).toMatchObject({ status: 'pending_payment', tenantId: tenantA });
+      });
+
+      it('announces a cancellation once, not on a repeat', async () => {
+        const p = await liveProduct('Mail Cancel', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        await orders.cancelByBuyer(tenantA, buyer, order.id);
+        await orders.cancelByBuyer(tenantA, buyer, order.id);
+        const cancelled = (await announced(order.id)).filter((e) => (e as { status?: string }).status === 'cancelled');
+        expect(cancelled).toHaveLength(1);
+      });
+
+      it('announces a refund', async () => {
+        const p = await liveProduct('Mail Refund', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.refund(tenantA, adminUser, order.id);
+        expect((await announced(order.id)).filter((e) => (e as { status?: string }).status === 'refunded')).toHaveLength(1);
+      });
+
+      it('says an order that was never paid timed out, so the email can explain', async () => {
+        const p = await liveProduct('Mail Timeout', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        await adminSql`update orders set placed_at = ${daysAgo(4)} where id = ${order.id}`;
+        await orders.reconcilePendingPayments(tenantA);
+        const cancelled = (await announced(order.id)).filter((e) => (e as { status?: string }).status === 'cancelled');
+        expect(cancelled).toHaveLength(1);
+        expect(cancelled[0]).toMatchObject({ cause: 'unpaid' });
+      });
+
+      it('reminds an unpaid order once, after 48 hours, and never twice', async () => {
+        const p = await liveProduct('Mail Reminder', 700);
+        const { order } = await checkoutAs('manual', p.id);
+        const reminders = async () => (await announced(order.id)).filter((e) => e.name === 'order.payment_reminder');
+
+        await adminSql`update orders set placed_at = ${daysAgo(1.5)} where id = ${order.id}`;
+        expect((await orders.reconcilePendingPayments(tenantA)).reminded).toBe(0); // too early
+        expect(await reminders()).toHaveLength(0);
+
+        await adminSql`update orders set placed_at = ${daysAgo(2.2)} where id = ${order.id}`;
+        expect((await orders.reconcilePendingPayments(tenantA)).reminded).toBeGreaterThanOrEqual(1);
+        expect(await reminders()).toHaveLength(1);
+        await orders.reconcilePendingPayments(tenantA);
+        expect(await reminders()).toHaveLength(1); // the second pass finds it already sent
+        await adminSql`update orders set status = 'cancelled' where id = ${order.id}`; // out of the way of the other reconciliation tests
+      });
+
+      it('does not nag a buyer who says they already paid', async () => {
+        const p = await liveProduct('Mail No Nag', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        const zelle = (await payments.listManualMethods(tenantA, 100)).find((m) => m.kind === 'zelle');
+        if (!zelle) throw new Error('no zelle method in the test store');
+        await adminSql`
+          INSERT INTO media (tenant_id, owner_type, owner_id, key_original, key_thumb, key_card, key_full, status)
+          VALUES (${tenantA}, 'payment_proof', ${order.id}, 'o.jpg', 'public/t.webp', 'public/c.webp', 'public/f.webp', 'ready')`;
+        await orders.reportTransfer(tenantA, buyer, order.id, { methodId: zelle.id, transferReference: 'NONAG1' });
+        await adminSql`update orders set placed_at = ${daysAgo(2.2)} where id = ${order.id}`;
+        await orders.reconcilePendingPayments(tenantA);
+        expect((await announced(order.id)).filter((e) => e.name === 'order.payment_reminder')).toHaveLength(0);
+        await adminSql`update orders set status = 'cancelled' where id = ${order.id}`;
+      });
+    });
+
+    describe('the bell: who is told at each step', () => {
+      // Feeds what orders / fulfilment announced through the real notification handlers, as the worker would.
+      async function drain() {
+        const { events } = await import('../../core/events.js');
+        const handlers = new Map(vi.mocked(events.on).mock.calls.map(([name, fn]) => [name as string, fn as (payload: unknown) => Promise<void>]));
+        const emit = vi.mocked(events.emit);
+        const queued = emit.mock.calls.splice(0);
+        for (const [name, payload] of queued) await handlers.get(name as string)?.(payload);
+      }
+      const kindsFor = async (userId: string, orderId: string) =>
+        (await adminSql<{ kind: string; data: Record<string, string> }[]>`SELECT kind, data FROM notifications WHERE user_id = ${userId} AND order_id = ${orderId} ORDER BY created_at`);
+
+      it('tells the store, the courier and the buyer as the order moves, and the store when a delivery fails', async () => {
+        const { registerNotificationsWorker } = await import('../notifications/index.js');
+        const { events } = await import('../../core/events.js');
+        vi.mocked(events.on).mockClear();
+        registerNotificationsWorker();
+        const { fulfilmentService: f } = await import('../fulfilment/index.js');
+
+        const adminId = crypto.randomUUID();
+        await adminSql`
+          INSERT INTO users (id, tenant_id, supertokens_user_id, email, full_name, role)
+          VALUES (${adminId}, ${tenantA}, ${crypto.randomUUID()}, ${`owner-${adminId}@example.com`}, 'Owner', 'admin')`;
+        const courierUserId = crypto.randomUUID();
+        await adminSql`
+          INSERT INTO users (id, tenant_id, supertokens_user_id, email, full_name, phone, role)
+          VALUES (${courierUserId}, ${tenantA}, ${crypto.randomUUID()}, ${`bell-courier-${courierUserId}@example.com`}, 'Bell Courier', '+53 5 5550000', 'courier')`;
+        const courier = (await f.listCouriers(tenantA)).find((c) => c.name === 'Bell Courier');
+        if (!courier) throw new Error('courier not listed');
+
+        await drain(); // whatever earlier tests announced
+        const p = await liveProduct('Bell Flow', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        await drain();
+        expect((await kindsFor(adminId, order.id)).map((r) => r.kind)).toEqual(['new_order']);
+
+        await orders.adminMarkPaid(tenantA, adminUser, order.id);
+        await orders.adminMarkPreparing(tenantA, adminUser, order.id);
+        await drain();
+        expect((await kindsFor(adminId, order.id)).map((r) => r.kind)).toEqual(['new_order', 'order_paid']);
+        expect((await kindsFor(buyer, order.id)).map((r) => r.kind)).toEqual(['buyer_paid']);
+
+        const a = await f.assignCourier(tenantA, adminUser, order.id, courier.id);
+        await drain();
+        expect((await kindsFor(courierUserId, order.id)).map((r) => r.kind)).toEqual(['delivery_assigned']);
+
+        const actor = { id: courierUserId, role: 'courier' };
+        await f.accept(tenantA, actor, a.id);
+        await f.pickUp(tenantA, actor, a.id);
+        await drain();
+        expect((await kindsFor(adminId, order.id)).map((r) => r.kind)).toEqual(['new_order', 'order_paid', 'delivery_accepted', 'delivery_picked_up']);
+        expect((await kindsFor(buyer, order.id)).map((r) => r.kind)).toEqual(['buyer_paid', 'buyer_on_the_way']);
+
+        await f.fail(tenantA, actor, a.id, 'recipient_absent', 'nobody home');
+        await drain();
+        const failed = (await kindsFor(adminId, order.id)).at(-1);
+        expect(failed).toMatchObject({ kind: 'delivery_failed', data: { courierName: 'Bell Courier', reason: 'recipient_absent', note: 'nobody home' } });
+
+        // taking it from the courier tells the courier; delivering tells the store and the buyer
+        const b = await f.assignCourier(tenantA, adminUser, order.id, courier.id);
+        await f.releaseAssignment(tenantA, adminUser, order.id);
+        await drain();
+        expect((await kindsFor(courierUserId, order.id)).map((r) => r.kind)).toEqual(['delivery_assigned', 'delivery_assigned', 'delivery_released']);
+        await f.assignCourier(tenantA, adminUser, order.id, courier.id);
+        await f.confirmDelivery(tenantA, courierUserId, order.id, {}, 'courier');
+        await drain();
+        expect((await kindsFor(adminId, order.id)).at(-1)?.kind).toBe('order_delivered');
+        expect((await kindsFor(buyer, order.id)).map((r) => r.kind)).toEqual(['buyer_paid', 'buyer_on_the_way', 'buyer_delivered']);
+        expect(b.status).toBe('assigned');
+      });
+
+      it('tells the buyer an unpaid order timed out, with the reason', async () => {
+        const { registerNotificationsWorker } = await import('../notifications/index.js');
+        const { events } = await import('../../core/events.js');
+        vi.mocked(events.on).mockClear();
+        registerNotificationsWorker();
+        await drain();
+        const p = await liveProduct('Bell Timeout', 700);
+        const { buyer, order } = await checkoutAs('manual', p.id);
+        await adminSql`update orders set placed_at = now() - interval '4 days' where id = ${order.id}`;
+        await orders.reconcilePendingPayments(tenantA);
+        await drain();
+        expect((await kindsFor(buyer, order.id)).at(-1)).toMatchObject({ kind: 'buyer_cancelled', data: { cause: 'unpaid' } });
       });
     });
 

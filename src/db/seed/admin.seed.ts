@@ -20,6 +20,13 @@ const seedEnv = z.object({
   SEED_TENANT_SLUG: z.string().min(1).default('demo'),
   SEED_TENANT_NAME: z.string().min(1).default('Demo Shop'),
   SEED_ADMIN_EMAIL: z.string().email(),
+  // Optional details for the person (shown in the team list and on their orders' audit trail).
+  SEED_ADMIN_NAME: z.string().trim().min(1).max(255).optional(),
+  SEED_ADMIN_PHONE: z
+    .string()
+    .trim()
+    .regex(/^\+?[0-9 ()-]{7,20}$/)
+    .optional(),
   // admin (default) or staff (the packer). Re-running with another role changes an existing user's role.
   SEED_ROLE: z.enum(['admin', 'staff', 'courier']).default('admin'),
   // The same policy the login endpoints enforce — signing up through the
@@ -69,6 +76,9 @@ async function main(): Promise<void> {
   }
 
   const user = await identityService.findOrCreateFromSession(tenant.id, authUser.id, env.SEED_ADMIN_EMAIL, env.SEED_ROLE);
+  if (env.SEED_ADMIN_NAME || env.SEED_ADMIN_PHONE) {
+    await identityService.updateProfile(tenant.id, user.id, { fullName: env.SEED_ADMIN_NAME, phone: env.SEED_ADMIN_PHONE });
+  }
   if (user.role !== env.SEED_ROLE) {
     await identityService.setRole(tenant.id, user.id, env.SEED_ROLE);
     // The role rides in the access token, so existing sessions would keep

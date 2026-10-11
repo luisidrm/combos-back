@@ -41,6 +41,9 @@ export const createTenantSchema = z.object({
 
 export type CreateTenantInput = z.infer<typeof createTenantSchema>;
 
+// A form sends "" for a field left empty; for these optional texts that means "clear it".
+const blankToNull = (v: unknown) => (typeof v === 'string' && v.trim() === '' ? null : v);
+
 const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (24 h)');
 
 // Per-store switches an admin can flip. Stored in the jsonb `settings`
@@ -48,10 +51,10 @@ const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, 'time must be HH:MM (
 // each new setting is added here deliberately, never accepted as free-form.
 export const updateTenantSchema = z.object({
   name: z.string().trim().min(1).max(255).optional(),
-  taglineEs: z.string().trim().max(255).nullable().optional(),
-  taglineEn: z.string().trim().max(255).nullable().optional(),
-  descriptionEs: z.string().trim().max(5000).nullable().optional(),
-  descriptionEn: z.string().trim().max(5000).nullable().optional(),
+  taglineEs: z.preprocess(blankToNull, z.string().trim().max(255).nullable().optional()),
+  taglineEn: z.preprocess(blankToNull, z.string().trim().max(255).nullable().optional()),
+  descriptionEs: z.preprocess(blankToNull, z.string().trim().max(5000).nullable().optional()),
+  descriptionEn: z.preprocess(blankToNull, z.string().trim().max(5000).nullable().optional()),
   settings: z
     .object({
       // Whether a delivery needs a proof photo before it can be marked
@@ -66,19 +69,15 @@ export const updateTenantSchema = z.object({
       // How buyers can reach the shop.
       contact: z
         .object({
-          phone: z.string().trim().max(40).nullable().optional(),
-          email: z.string().trim().email().max(255).nullable().optional(),
-          address: z.string().trim().max(500).nullable().optional(),
+          phone: z.preprocess(blankToNull, z.string().trim().max(40).nullable().optional()),
+          email: z.preprocess(blankToNull, z.string().trim().email().max(255).nullable().optional()),
+          address: z.preprocess(blankToNull, z.string().trim().max(500).nullable().optional()),
         })
         .optional(),
-      // Seven entries, Monday first; null = closed that day. null for the whole field clears it.
-      openingHours: z.array(z.object({ open: hhmm, close: hhmm }).nullable()).length(7).nullable().optional(),
     })
     .optional(),
 });
 export type UpdateTenantInput = z.infer<typeof updateTenantSchema>;
-
-export type OpeningHours = Array<{ open: string; close: string } | null>;
 
 export interface StoreContact {
   phone: string | null;
@@ -91,5 +90,4 @@ export interface TenantSettings {
   freeDeliveryOverCents: number | null;
   sameDayCutoff: string | null;
   contact: StoreContact;
-  openingHours: OpeningHours | null;
 }

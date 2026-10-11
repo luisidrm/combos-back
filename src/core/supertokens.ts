@@ -2,9 +2,11 @@ import supertokens from 'supertokens-node';
 import EmailPassword from 'supertokens-node/recipe/emailpassword';
 import EmailVerification from 'supertokens-node/recipe/emailverification';
 import Session from 'supertokens-node/recipe/session';
+import ThirdParty from 'supertokens-node/recipe/thirdparty';
 import { config } from '../config/index.js';
-import { InternalError, UnauthorizedError, ValidationError } from './errors.js';
+import { ForbiddenError, InternalError, UnauthorizedError, ValidationError } from './errors.js';
 import { logger } from './logger.js';
+import { validatePassword } from './password-policy.js';
 import { redisConnection } from './queue.js';
 import { createRedisStore, enforceLimit, type LimitRule } from './rate-limit.js';
 import { identityService } from '../modules/identity/index.js';
@@ -22,10 +24,8 @@ const VERIFY_EMAIL_PER_USER: LimitRule = { name: 'verify-email-user', limit: 5, 
 // Each reset request sends an email to a real inbox.
 const RESET_PER_EMAIL: LimitRule = { name: 'password-reset-email', limit: 3, windowSeconds: 60 * 60 };
 
-// Everyone with a password (buyers and staff) meets the same bar, above
-// SuperTokens' default (8 characters): at least 10, with a letter and a digit.
-// Applies at signup and at reset.
-const MIN_PASSWORD_LENGTH = 10;
+// The password rule lives in password-policy.ts (shared with the identity module).
+export { validatePassword };
 
 // SuperTokens users are global, but a login is always *for* one store. The
 // tenant comes from the same x-tenant-slug header resolveTenant reads. A
@@ -40,6 +40,29 @@ const SLUG_PATTERN = /^[a-z0-9-]{1,63}$/;
 // Same looseness as the recipient phone in orders.schema.ts: rejects junk, not formatting.
 const PHONE_PATTERN = /^\+?[0-9 ()-]{7,20}$/;
 const PROFILE_KEY = 'comboSignUpProfile';
+
+// The language an email to this person is written in. Needs the store (a login is global, the language is per store);
+// anything that cannot be worked out reads Spanish, the store's default.
+async function emailLocaleFor(userContext: Record<string, unknown>, supertokensUserId: string): Promise<'es' | 'en'> {
+  const tenantId = userContext[TENANT_ID_KEY] as string | undefined;
+  if (!tenantId) return 'es';
+  try {
+    const user = await identityService.findBySupertokensUserId(tenantId, supertokensUserId);
+    return user?.locale === 'en' ? 'en' : 'es';
+  } catch (err) {
+    logger.warn({ err }, 'Could not look up the language for an email; using Spanish');
+    return 'es';
+  }
+}
+
+// Remember which store this request is for (when it names one), so the emails it triggers carry that store's name.
+async function rememberTenant(userContext: Record<string, unknown>, req: HeaderReader): Promise<void> {
+  try {
+    userContext[TENANT_ID_KEY] = await resolveTenantId(req);
+  } catch {
+    // No usable store header: the email falls back to the default language and the platform's own wording.
+  }
+}
 
 type HeaderReader = { getHeaderValue(name: string): string | undefined };
 
@@ -64,19 +87,6 @@ function requireContext<T>(userContext: Record<string, unknown>, key: string): T
   return value as T;
 }
 
-export function validatePassword(value: unknown): string | undefined {
-  if (typeof value !== 'string' || value.length < MIN_PASSWORD_LENGTH) {
-    return `Password must be at least ${MIN_PASSWORD_LENGTH} characters long`;
-  }
-  if (value.length > 100) {
-    return 'Password must be at most 100 characters long';
-  }
-  if (!/[a-zA-Z]/.test(value) || !/[0-9]/.test(value)) {
-    return 'Password must contain at least one letter and one number';
-  }
-  return undefined;
-}
-
 export function initSupertokens(): void {
   supertokens.init({
     framework: 'express',
@@ -85,7 +95,7 @@ export function initSupertokens(): void {
       apiKey: config.supertokens.apiKey,
     },
     appInfo: {
-      appName: 'Combo Shop',
+      appName: "Pa'Casa",
       apiDomain: config.appBaseUrl,
       websiteDomain: config.webBaseUrl,
       apiBasePath: '/auth',
@@ -110,6 +120,11 @@ export function initSupertokens(): void {
                   : 'Name is required (up to 255 characters)',
             },
             {
+              id: 'locale',
+              optional: true,
+              validate: async (value) => (value === '' || value === 'es' || value === 'en' ? undefined : 'Not a supported language'),
+            },
+            {
               id: 'phone',
               optional: true,
               validate: async (value) =>
@@ -125,7 +140,11 @@ export function initSupertokens(): void {
               // (/admin/reset-password serves everyone with a password), keeping
               // SuperTokens' token query.
               const link = `${config.webBaseUrl}/admin/reset-password${new URL(input.passwordResetLink).search}`;
-              await notificationsService.sendPasswordResetLink(input.user.email, link);
+              const tenantId = input.userContext[TENANT_ID_KEY] as string | undefined;
+              await notificationsService.sendPasswordResetLink(input.user.email, link, {
+                locale: await emailLocaleFor(input.userContext, input.user.id),
+                tenantId,
+              });
             },
           }),
         },
@@ -145,7 +164,7 @@ export function initSupertokens(): void {
                 const value = input.formFields.find((f) => f.id === id)?.value;
                 return typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined;
               };
-              input.userContext[PROFILE_KEY] = { fullName: field('name'), phone: field('phone') };
+              input.userContext[PROFILE_KEY] = { fullName: field('name'), phone: field('phone'), locale: field('locale') };
               return original.signUpPOST(input);
             },
             signInPOST: async (input) => {
@@ -163,6 +182,7 @@ export function initSupertokens(): void {
               if (!original.generatePasswordResetTokenPOST) {
                 throw new InternalError('EmailPassword generatePasswordResetTokenPOST is unavailable');
               }
+              await rememberTenant(input.userContext, input.options.req);
               const email = input.formFields.find((field) => field.id === 'email')?.value;
               if (typeof email === 'string') {
                 await enforceLimit(rateLimitStore, RESET_PER_EMAIL, email.trim().toLowerCase());
@@ -193,6 +213,12 @@ export function initSupertokens(): void {
           functions: (original) => ({
             ...original,
             signUp: async (input) => {
+              // One email = one account per store: an address that already has a login here (it signed up with Google)
+              // cannot also be registered with a password. Only the public signup sets a tenant (the seed does not).
+              const signUpTenant = input.userContext[TENANT_ID_KEY] as string | undefined;
+              if (signUpTenant && (await identityService.findByEmail(signUpTenant, input.email))) {
+                return { status: 'EMAIL_ALREADY_EXISTS_ERROR' };
+              }
               const result = await original.signUp(input);
               // Only the public signup API sets a tenant; a server-side call
               // (the admin seed script) creates the login and its own `users` row.
@@ -200,7 +226,7 @@ export function initSupertokens(): void {
               if (result.status !== 'OK' || tenantId === undefined) {
                 return result;
               }
-              const profile = (input.userContext[PROFILE_KEY] ?? {}) as { fullName?: string; phone?: string };
+              const profile = (input.userContext[PROFILE_KEY] ?? {}) as { fullName?: string; phone?: string; locale?: string };
               const user = await identityService.findOrCreateFromSession(tenantId, result.user.id, input.email, 'buyer', profile);
               input.userContext[ROLE_KEY] = user.role;
               // Ask them to confirm the address, once, right after creating the
@@ -258,7 +284,11 @@ export function initSupertokens(): void {
               // locale is added by the web app's middleware) instead of
               // SuperTokens' default route, keeping its token/tenantId query.
               const link = `${config.webBaseUrl}/account/verify-email${new URL(input.emailVerifyLink).search}`;
-              await notificationsService.sendEmailVerificationLink(input.user.email, link);
+              const tenantId = input.userContext[TENANT_ID_KEY] as string | undefined;
+              await notificationsService.sendEmailVerificationLink(input.user.email, link, {
+                locale: await emailLocaleFor(input.userContext, input.user.id),
+                tenantId,
+              });
             },
           }),
         },
@@ -271,11 +301,87 @@ export function initSupertokens(): void {
                 throw new InternalError('EmailVerification generateEmailVerifyTokenPOST is unavailable');
               }
               await enforceLimit(rateLimitStore, VERIFY_EMAIL_PER_USER, input.session.getUserId());
+              await rememberTenant(input.userContext, input.options.req);
               return original.generateEmailVerifyTokenPOST(input);
             },
           }),
         },
       }),
+
+      // Sign in with Google — buyers only, and only when GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET are set (without them
+      // nothing below is registered and sign-in behaves exactly as before).
+      //
+      // One email = one account per store, enforced HERE rather than by SuperTokens' AccountLinking recipe: that recipe is a
+      // licensed feature of the core (it answers 402 without a license, and merely registering it breaks password login).
+      // So Google never links to, or sits next to, an existing account: an email that already has a password account (or is
+      // staff) is refused with a clear reason, and the password signup refuses an email that already signed up with Google.
+      ...(config.google
+        ? [
+            ThirdParty.init({
+              signInAndUpFeature: {
+                providers: [
+                  {
+                    config: {
+                      thirdPartyId: 'google',
+                      // "profile" is what brings the person's name.
+                      clients: [{ clientId: config.google.clientId, clientSecret: config.google.clientSecret, scope: ['openid', 'email', 'profile'] }],
+                    },
+                  },
+                ],
+              },
+              override: {
+                apis: (original) => ({
+                  ...original,
+                  // Like every login, always *for* one store: read from the same x-tenant-slug header.
+                  signInUpPOST: async (input) => {
+                    if (!original.signInUpPOST) {
+                      throw new InternalError('ThirdParty signInUpPOST is unavailable');
+                    }
+                    input.userContext[TENANT_ID_KEY] = await resolveTenantId(input.options.req);
+                    return original.signInUpPOST(input);
+                  },
+                }),
+                functions: (original) => ({
+                  ...original,
+                  signInUp: async (input) => {
+                    const tenantId = requireContext<string>(input.userContext, TENANT_ID_KEY);
+                    // An address Google did not confirm proves nothing about who owns it.
+                    if (!input.isVerified) {
+                      throw new ForbiddenError('Google did not confirm this email address', { reason: 'EMAIL_NOT_VERIFIED' });
+                    }
+                    // Checked BEFORE anything is created, so a refused address never gains a Google login.
+                    const existing = await identityService.findByEmail(tenantId, input.email);
+                    // A returning Google visitor is recognised by their Google identity, not by the address.
+                    const known = existing
+                      ? await supertokens.listUsersByAccountInfo(SUPERTOKENS_TENANT, { thirdParty: { id: input.thirdPartyId, userId: input.thirdPartyUserId } })
+                      : [];
+                    const verdict = identityService.googleSignInVerdict(existing, known[0]?.id);
+                    // Staff (admin, packer, courier) keep email + password: if Google could log into an admin account, the
+                    // admin's security would be only as strong as that Google account.
+                    if (verdict === 'staff') {
+                      throw new ForbiddenError('This account signs in with email and password', { reason: 'STAFF_USE_PASSWORD' });
+                    }
+                    if (verdict === 'has_password_account') {
+                      throw new ForbiddenError('This email already has an account with a password', { reason: 'EMAIL_HAS_PASSWORD_ACCOUNT' });
+                    }
+                    const result = await original.signInUp(input);
+                    if (result.status !== 'OK') return result;
+
+                    const info = input.rawUserInfoFromProvider.fromIdTokenPayload ?? input.rawUserInfoFromProvider.fromUserInfoAPI ?? {};
+                    const name = typeof info.name === 'string' ? info.name.trim().slice(0, 255) : '';
+                    // A disabled account throws here (findOrCreateFromSession refuses it). A new one is a buyer with
+                    // Google's name and no phone: the web app then asks for the missing details.
+                    const user = await identityService.findOrCreateFromSession(tenantId, result.user.id, input.email, 'buyer', {
+                      fullName: name || undefined,
+                    });
+                    input.userContext[ROLE_KEY] = user.role;
+                    return result;
+                  },
+                }),
+              },
+            }),
+          ]
+        : []),
 
       // tenantId and role go in the access token (CLAUDE.md section 7), read
       // back by requireAuth / requireRole without a DB round trip. A
@@ -290,6 +396,8 @@ export function initSupertokens(): void {
         // nothing here should depend on a client behaving. Pinning it removes
         // the choice entirely, for every client, always.
         getTokenTransferMethod: () => 'cookie',
+        // Shared by the web app and the API in production (see COOKIE_DOMAIN in config/env.ts); unset locally.
+        cookieDomain: config.supertokens.cookieDomain,
         override: {
           functions: (original) => ({
             ...original,

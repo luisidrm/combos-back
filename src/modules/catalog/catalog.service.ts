@@ -1,4 +1,5 @@
 import { ConflictError, NotFoundError, ValidationError } from '../../core/errors.js';
+import { collectAll, decodeCursor, toPage, type Page, type PageQuery } from '../../core/pagination.js';
 import { logger } from '../../core/logger.js';
 import { withTenant, type Transaction } from '../../db/client.js';
 import { isUniqueViolation } from '../../db/errors.js';
@@ -152,12 +153,20 @@ async function updateCategory(tenantId: string, id: string, input: UpdateCategor
   });
 }
 
+// Every product must have a category, so one that still has products cannot be deleted: move or delete those
+// products first (the admin screen says how many).
 async function deleteCategory(tenantId: string, id: string): Promise<void> {
   await withTenant(tenantId, async (tx) => {
+    if (!(await catalogRepo.findCategoryById(tx, id))) {
+      throw new NotFoundError(`No category with id "${id}"`);
+    }
+    const inUse = await catalogRepo.countProductsInCategory(tx, id);
+    if (inUse > 0) {
+      throw new ConflictError('This category still has products', { reason: 'CATEGORY_IN_USE', productCount: inUse });
+    }
     if (!(await catalogRepo.softDeleteCategory(tx, id))) {
       throw new NotFoundError(`No category with id "${id}"`);
     }
-    await catalogRepo.clearCategoryFromProducts(tx, id);
   });
 }
 
@@ -176,29 +185,69 @@ async function reorderCategories(tenantId: string, ids: string[]): Promise<void>
 
 // --- products (admin) -----------------------------------------------------
 
-async function listProductsForAdmin(
-  tenantId: string,
-  filter: { categoryId?: string; active?: boolean },
-): Promise<Product[]> {
-  return withTenant(tenantId, (tx) => catalogRepo.listProducts(tx, filter));
+// A product row as the admin sees it, plus its cover: the first ready picture (the chosen cover first), so the
+// list can show a thumbnail. A draft has one too, as soon as a picture has finished processing.
+export type AdminProduct = Product & { cover: PublicPicture | null };
+
+async function withCovers(tenantId: string, rows: Product[]): Promise<AdminProduct[]> {
+  const pictures = await mediaService.getPublicPictures(
+    tenantId,
+    'product',
+    rows.map((row) => row.id),
+  );
+  return rows.map((row) => ({ ...row, cover: pictures.get(row.id)?.[0] ?? null }));
 }
 
-async function getProductForAdmin(tenantId: string, id: string): Promise<Product> {
-  return withTenant(tenantId, async (tx) => {
-    const product = await catalogRepo.findProductById(tx, id);
-    if (!product) {
+// A cursor says where the last page ended: [sort_order, product id]. Both go straight into SQL casts, so a hand-edited
+// cursor must be a 400, never a database error.
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function productCursor(cursor: string | undefined): [number, string] | undefined {
+  if (!cursor) return undefined;
+  const [order, id] = decodeCursor(cursor, 2);
+  if (typeof order !== 'number' || !Number.isInteger(order) || typeof id !== 'string' || !UUID.test(id)) {
+    throw new ValidationError('That page cursor is not valid', { reason: 'BAD_CURSOR' });
+  }
+  return [order, id];
+}
+const productCursorOf = (row: Product): Array<string | number> => [row.sortOrder, row.id];
+
+// One page of the owner's product list (drafts included), each with its cover. `q` searches name and slug.
+async function pageProductsForAdmin(
+  tenantId: string,
+  filter: { categoryId?: string; active?: boolean; q?: string },
+  page: PageQuery,
+): Promise<Page<AdminProduct>> {
+  const after = productCursor(page.cursor);
+  const rows = await withTenant(tenantId, (tx) => catalogRepo.pageProducts(tx, filter, { limit: page.limit + 1, after }));
+  const result = toPage(rows, page.limit, productCursorOf);
+  return { items: await withCovers(tenantId, result.items), nextCursor: result.nextCursor };
+}
+
+// How many products there are, how many are live, how many are low or out of stock: the screen's badges.
+async function summarizeProductsForAdmin(tenantId: string): Promise<{ total: number; live: number; lowStock: number }> {
+  return withTenant(tenantId, (tx) => catalogRepo.summarizeProducts(tx));
+}
+
+// Every product (internal callers and tests; the API serves pages).
+async function listProductsForAdmin(tenantId: string, filter: { categoryId?: string; active?: boolean }): Promise<AdminProduct[]> {
+  return collectAll((cursor) => pageProductsForAdmin(tenantId, filter, { limit: 100, cursor }));
+}
+
+async function getProductForAdmin(tenantId: string, id: string): Promise<AdminProduct> {
+  const product = await withTenant(tenantId, async (tx) => {
+    const found = await catalogRepo.findProductById(tx, id);
+    if (!found) {
       throw new NotFoundError(`No product with id "${id}"`);
     }
-    return product;
+    return found;
   });
+  return (await withCovers(tenantId, [product]))[0] as AdminProduct;
 }
 
 async function createProduct(tenantId: string, input: CreateProductInput): Promise<Product> {
   return translateSlugCollision(() =>
     withTenant(tenantId, async (tx) => {
-      if (input.categoryId) {
-        await assertCategoryExists(tx, input.categoryId);
-      }
+      await assertCategoryExists(tx, input.categoryId);
 
       let slug: string;
       if (input.slug) {
@@ -239,6 +288,10 @@ async function updateProduct(tenantId: string, id: string, input: UpdateProductI
       }
       if (input.categoryId) {
         await assertCategoryExists(tx, input.categoryId);
+      } else if (existing.categoryId === null && Object.keys(input).some((key) => key !== 'stockStatus')) {
+        // A product that predates the rule keeps working (a stock flip needs no category), but any other edit
+        // has to give it one.
+        throw new ValidationError('Choose a category for this product', { reason: 'CATEGORY_REQUIRED' });
       }
       if (input.slug && input.slug !== existing.slug && (await catalogRepo.slugExists(tx, input.slug, id))) {
         throw new ConflictError(`A product with slug "${input.slug}" already exists`);
@@ -259,6 +312,10 @@ async function activateProduct(tenantId: string, id: string): Promise<Product> {
   const product = await getProductForAdmin(tenantId, id);
   if (product.active) {
     return product;
+  }
+
+  if (product.categoryId === null) {
+    throw new ConflictError('Choose a category for this product before making it visible', { reason: 'CATEGORY_REQUIRED' });
   }
 
   if (!(await mediaService.hasReadyPicture(tenantId, 'product', id))) {
@@ -324,14 +381,22 @@ async function listPublicCategories(tenantId: string): Promise<PublicCategory[]>
   return rows.map(({ id, nameEs, nameEn, icon }) => ({ id, nameEs, nameEn, icon }));
 }
 
-async function listPublicProducts(tenantId: string, filter: { categoryId?: string }): Promise<PublicProduct[]> {
-  const rows = await withTenant(tenantId, (tx) => catalogRepo.listProducts(tx, { ...filter, active: true }));
+// One page of the shop window: live products only, in the owner's order.
+async function pagePublicProducts(tenantId: string, filter: { categoryId?: string; q?: string }, page: PageQuery): Promise<Page<PublicProduct>> {
+  const after = productCursor(page.cursor);
+  const rows = await withTenant(tenantId, (tx) => catalogRepo.pageProducts(tx, { ...filter, active: true }, { limit: page.limit + 1, after }));
+  const result = toPage(rows, page.limit, productCursorOf);
   const pictures = await mediaService.getPublicPictures(
     tenantId,
     'product',
-    rows.map((row) => row.id),
+    result.items.map((row) => row.id),
   );
-  return rows.map((row) => toPublicProduct(row, pictures.get(row.id) ?? []));
+  return { items: result.items.map((row) => toPublicProduct(row, pictures.get(row.id) ?? [])), nextCursor: result.nextCursor };
+}
+
+// Every live product (internal callers and tests; the API serves pages).
+async function listPublicProducts(tenantId: string, filter: { categoryId?: string }): Promise<PublicProduct[]> {
+  return collectAll((cursor) => pagePublicProducts(tenantId, filter, { limit: 100, cursor }));
 }
 
 async function getPublicProductBySlug(tenantId: string, slug: string): Promise<PublicProductDetail> {
@@ -369,6 +434,9 @@ export const catalogService = {
   deleteCategory,
   reorderCategories,
   listProductsForAdmin,
+  pageProductsForAdmin,
+  summarizeProductsForAdmin,
+  pagePublicProducts,
   getProductForAdmin,
   createProduct,
   updateProduct,

@@ -1,4 +1,4 @@
-export { ordersRouter as router, recipientsRouter } from './orders.routes.js';
+export { ordersRouter as router, recipientsRouter, sharedRouter } from './orders.routes.js';
 export { ordersService, orderStatuses } from './orders.service.js';
 export type {
   AddressView,
@@ -16,6 +16,8 @@ export type {
   QuoteBlocker,
   ReconciliationResult,
   RecipientView,
+  SharedOrder,
+  SharedOrderItem,
 } from './orders.service.js';
 export type { OrderStatus } from './orders.schema.js';
 export { registerOrdersWorker, runOrderReconciliation } from './orders.worker.js';
