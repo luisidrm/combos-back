@@ -50,6 +50,7 @@ export const config = {
 
   resendApiKey: env.RESEND_API_KEY,
   emailFrom: env.EMAIL_FROM,
+  emailTemplates: env.EMAIL_TEMPLATES,
   sendEmails: env.SEND_EMAILS ? env.SEND_EMAILS === 'true' : env.NODE_ENV === 'production',
 
   sentryDsn: env.SENTRY_DSN,

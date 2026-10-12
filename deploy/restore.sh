@@ -6,7 +6,9 @@
 # Do this on a scratch server first, to know it works and how long it takes.
 set -eu
 cd "$(dirname "$0")"
-. ./.env.production
+# Reads one value from .env.production without running it as a script (a value such as Pa'Casa <x@y> would break "source").
+env_value() { grep -E "^$1=" .env.production | head -n 1 | cut -d= -f2-; }
+POSTGRES_USER="$(env_value POSTGRES_USER)"
 
 DIR="${1:?Usage: ./restore.sh backups/<timestamp>}"
 [ -f "$DIR/combo_shop.dump" ] || { echo "$DIR/combo_shop.dump not found"; exit 1; }

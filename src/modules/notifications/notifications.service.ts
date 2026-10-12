@@ -6,6 +6,7 @@ import { decodeCursor, toPage, type Page, type PageQuery } from '../../core/pagi
 import { withTenant } from '../../db/client.js';
 import * as notificationsRepo from './notifications.repo.js';
 import type { Notification, NotificationKind } from './notifications.schema.js';
+import { accountTemplateSend, orderTemplateSend, type TemplateSend } from './notifications.resend-templates.js';
 import {
   orderEmail,
   passwordResetEmail,
@@ -48,7 +49,7 @@ async function brandFor(tenantId?: string): Promise<EmailBrand> {
 // The one place an email leaves the building. Outside production nothing is emailed (SEND_EMAILS) and the event is
 // logged without the address or names (CLAUDE.md section 13: no PII) — except links, which are the whole point of
 // trying a flow without a Resend key, and never in production.
-async function deliver(to: string, mail: RenderedEmail, what: string, devLog: Record<string, unknown> = {}): Promise<void> {
+async function deliver(to: string, mail: RenderedEmail, what: string, devLog: Record<string, unknown> = {}, template: TemplateSend | null = null): Promise<void> {
   if (!config.sendEmails) {
     logger.info(devLog, `${what} (not emailed: sending is off)`);
     return;
@@ -58,6 +59,19 @@ async function deliver(to: string, mail: RenderedEmail, what: string, devLog: Re
   if (isUndeliverableTestAddress(to)) {
     logger.info({ ...devLog, reason: 'reserved test domain' }, `${what} (not emailed: the address is a test address)`);
     return;
+  }
+  // Through a Resend template when that is switched on (EMAIL_TEMPLATES=resend) and this email has one. If Resend does not
+  // accept it (the template was never uploaded or published, or was edited in a way that needs other variables), the SAME
+  // email goes out the ordinary way: an email is never lost over how it is dressed.
+  if (template && config.emailTemplates === 'resend') {
+    const viaTemplate = await resend.emails.send({
+      from: config.emailFrom,
+      to,
+      subject: mail.subject,
+      template: { id: template.alias, variables: template.variables },
+    });
+    if (!viaTemplate.error) return;
+    logger.warn({ ...devLog, template: template.alias, providerError: viaTemplate.error.name }, `${what}: the Resend template was not used; sending it directly`);
   }
   const { error } = await resend.emails.send({ from: config.emailFrom, to, subject: mail.subject, html: mail.html, text: mail.text });
   if (error) {
@@ -94,16 +108,20 @@ interface AccountEmailOptions {
 // The "confirm your email" link sent once after a buyer signs up (and again on request). Called from the SuperTokens
 // email-delivery hook in core/supertokens.ts.
 async function sendEmailVerificationLink(email: string, link: string, options: AccountEmailOptions = {}): Promise<void> {
-  const mail = verificationEmail(options.locale ?? 'es', await brandFor(options.tenantId), link);
-  await deliver(email, mail, 'email verification message', { link });
+  const locale = options.locale ?? 'es';
+  const brand = await brandFor(options.tenantId);
+  const mail = verificationEmail(locale, brand, link);
+  await deliver(email, mail, 'email verification message', { link }, accountTemplateSend('verify-email', locale, brand, link));
 }
 
 // The password-reset link for accounts with a password. The link carries a single-use secret token that is valid for
 // about an hour. Outside production the link goes to the log: the one place a token is logged — never in production,
 // and never the address.
 async function sendPasswordResetLink(email: string, link: string, options: AccountEmailOptions = {}): Promise<void> {
-  const mail = passwordResetEmail(options.locale ?? 'es', await brandFor(options.tenantId), link);
-  await deliver(email, mail, 'password reset email', { link });
+  const locale = options.locale ?? 'es';
+  const brand = await brandFor(options.tenantId);
+  const mail = passwordResetEmail(locale, brand, link);
+  await deliver(email, mail, 'password reset email', { link }, accountTemplateSend('reset-password', locale, brand, link));
 }
 
 export interface SendOrderEmail {
@@ -115,8 +133,9 @@ export interface SendOrderEmail {
 
 // An email about an order, to its buyer: placed, paid, on the way, delivered, cancelled, refunded, or a payment reminder.
 async function sendOrderEmail(email: string, input: SendOrderEmail): Promise<void> {
-  const mail = orderEmail(input.kind, input.locale, await brandFor(input.tenantId), input.data);
-  await deliver(email, mail, 'order email', { orderNumber: input.data.orderNumber, kind: input.kind, locale: input.locale });
+  const brand = await brandFor(input.tenantId);
+  const mail = orderEmail(input.kind, input.locale, brand, input.data);
+  await deliver(email, mail, 'order email', { orderNumber: input.data.orderNumber, kind: input.kind, locale: input.locale }, orderTemplateSend(input.kind, input.locale, brand, input.data));
 }
 
 // To the store: a buyer says they sent a manual transfer, go and check the account. The amount and order number tell

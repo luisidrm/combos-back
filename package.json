@@ -23,6 +23,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "emails:preview": "tsx scripts/preview-emails.ts",
+    "emails:export": "tsx scripts/resend-templates.ts export",
+    "emails:push": "tsx scripts/resend-templates.ts push",
     "db:generate": "drizzle-kit generate",
     "db:seed:geo": "tsx src/db/seed/geo.seed.ts",
     "db:seed:admin": "tsx src/db/seed/admin.seed.ts",

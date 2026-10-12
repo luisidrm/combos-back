@@ -46,6 +46,8 @@ x-app-env: &app-env
     RESEND_API_KEY: ${RESEND_API_KEY}
     EMAIL_FROM: ${EMAIL_FROM}
     SEND_EMAILS: "true"
+    # "resend" = send through the templates uploaded to Resend (docs/EMAIL-TEMPLATES.md); "inline" = our own HTML.
+    EMAIL_TEMPLATES: ${EMAIL_TEMPLATES:-inline}
     SENTRY_DSN: ${SENTRY_DSN:-}
     SENTRY_ENVIRONMENT: production
     # Sign in with Google: on only when both are set (buyers only; staff keep email + password).

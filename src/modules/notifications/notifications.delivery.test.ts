@@ -12,6 +12,7 @@ describe('email delivery', () => {
 
   beforeAll(async () => {
     process.env.SEND_EMAILS = 'true';
+    process.env.EMAIL_TEMPLATES = 'resend';
     service = await import('./notifications.service.js');
   });
   beforeEach(() => send.mockReset());
@@ -36,6 +37,29 @@ describe('email delivery', () => {
     send.mockResolvedValue({ data: { id: '1' }, error: null });
     await service.notificationsService.sendOrderEmail('ana@gmail.com', order);
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('sends through the Resend template when that is switched on, with only the variables it uses', async () => {
+    send.mockResolvedValue({ data: { id: '1' }, error: null });
+    await service.notificationsService.sendOrderEmail('ana@gmail.com', order);
+    expect(send).toHaveBeenCalledTimes(1);
+    const payload = send.mock.calls[0]?.[0] as { template?: { id: string; variables: Record<string, string> }; html?: string; subject?: string };
+    expect(payload.template?.id).toBe('pacasa-order-paid-es');
+    expect(Object.keys(payload.template?.variables ?? {}).sort()).toEqual(['BRAND_NAME', 'BRAND_URL', 'GREETING', 'ORDER_NUMBER', 'ORDER_URL', 'RECIPIENT_NAME', 'SUPPORT']); // the paid email does not show the total
+    expect(payload.html).toBeUndefined(); // Resend refuses html together with a template
+    expect(payload.subject).toContain('FC-1');
+  });
+
+  it('sends the SAME email the ordinary way when Resend does not accept the template', async () => {
+    send
+      .mockResolvedValueOnce({ data: null, error: { name: 'not_found', statusCode: 404, message: 'Template not found' } })
+      .mockResolvedValueOnce({ data: { id: '2' }, error: null });
+    await service.notificationsService.sendOrderEmail('ana@gmail.com', order);
+    expect(send).toHaveBeenCalledTimes(2);
+    const second = send.mock.calls[1]?.[0] as { template?: unknown; html?: string; text?: string };
+    expect(second.template).toBeUndefined();
+    expect(second.html).toContain('<html');
+    expect(second.text).toContain('FC-1');
   });
 
   it('drops a refusal that a retry cannot fix, instead of failing the job', async () => {

@@ -1,38 +1,37 @@
-# Caddy: HTTPS for the three public names, nothing else is reachable from outside.
-# With Cloudflare in front, set its SSL mode to "Full (strict)"; Caddy gets its own certificates.
-{
-	# Only the owner's ACME contact; certificates are requested automatically for the names below.
-	email {$ACME_EMAIL}
-}
+# Caddy: HTTPS for the public names, nothing else is reachable from outside.
+# Cloudflare sits in front with SSL mode "Full (strict)"; Caddy uses the Cloudflare Origin Certificate.
 
 # The website
 {$SITE_DOMAIN} {
-	encode zstd gzip
-	reverse_proxy web:3000
+        tls /certs/origin.pem /certs/origin-key.pem
+        encode zstd gzip
+        reverse_proxy web:3000
 }
 
-# www.pacasa.net -> pacasa.net (one address, so cookies and links never split in two). Needs a DNS record for www.
+# www.pacasa.net -> pacasa.net (one address, so cookies and links never split in two).
 www.{$SITE_DOMAIN} {
-	redir https://{$SITE_DOMAIN}{uri} permanent
+        tls /certs/origin.pem /certs/origin-key.pem
+        redir https://{$SITE_DOMAIN}{uri} permanent
 }
 
 # The API (sessions are cookies shared with the site: see COOKIE_DOMAIN)
 {$API_DOMAIN} {
-	encode zstd gzip
-	# Operations endpoints are for the server itself (the health check and the deploy script reach them over the internal
-	# network), not for the internet: /metrics has its own token, but there is no reason for it to be reachable at all.
-	@internal path /metrics /metrics/*
-	respond @internal 404
-	reverse_proxy api:4000
-	header -Server
+        tls /certs/origin.pem /certs/origin-key.pem
+        encode zstd gzip
+        # /metrics is for the server itself, not for the internet.
+        @internal path /metrics /metrics/*
+        respond @internal 404
+        reverse_proxy api:4000
+        header -Server
 }
 
 # Pictures, and the browser's direct uploads to storage. MinIO signs upload URLs for this exact host,
 # so the Host header must reach it untouched (reverse_proxy keeps it by default).
 {$MEDIA_DOMAIN} {
-	header -Server
-	reverse_proxy minio:9000
-	# Picture files never change (their name contains their id), so browsers and Cloudflare may keep them for a year.
-	@pictures path /*/public/*
-	header @pictures Cache-Control "public, max-age=31536000, immutable"
+        tls /certs/origin.pem /certs/origin-key.pem
+        header -Server
+        reverse_proxy minio:9000
+        # Picture files never change (their name contains their id), so browsers and Cloudflare may keep them for a year.
+        @pictures path /*/public/*
+        header @pictures Cache-Control "public, max-age=31536000, immutable"
 }

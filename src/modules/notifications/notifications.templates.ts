@@ -31,13 +31,14 @@ const MUTED = '#5d6f73';
 const LINE = '#dde6e8';
 const PAGE_BG = '#eef3f4';
 
-const esc = (value: string): string =>
+/** HTML-escapes text that came from a person. Exported because values sent to a Resend template must be escaped the same way. */
+export const esc = (value: string): string =>
   value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
 /** `$48.50` in both languages, like the site (money is whole cents, USD). */
 export const usd = (cents: number): string => `$${(cents / 100).toFixed(2)}`;
 
-interface Fact {
+export interface Fact {
   label: string;
   value: string;
 }
@@ -50,6 +51,8 @@ interface Layout {
   heading: string;
   paragraphs: string[];
   facts?: Fact[];
+  /** Table rows already rendered as HTML (a Resend template receives them as one variable); replaces `facts`. */
+  factsRaw?: string;
   button?: { label: string; url: string };
   /** Small print under the button. */
   small?: string;
@@ -68,18 +71,22 @@ const FOOTER = {
   },
 } as const;
 
+/** The rows of the label / value table (the receipt, a transfer's details), as HTML. */
+export function factsRowsHtml(facts: Fact[]): string {
+  return facts
+    .map(
+      (fact) =>
+        `<tr><td style="padding:9px 0;border-bottom:1px solid ${LINE};color:${MUTED};font-size:14px">${esc(fact.label)}</td><td align="right" style="padding:9px 0 9px 12px;border-bottom:1px solid ${LINE};color:${INK};font-size:14px;font-weight:600">${esc(fact.value)}</td></tr>`,
+    )
+    .join('');
+}
+
 function renderLayout(l: Layout): { html: string; text: string } {
   const f = FOOTER[l.locale];
   const contactBits = [l.brand.supportEmail, l.brand.supportPhone].filter((v): v is string => Boolean(v));
 
-  const facts = l.facts?.length
-    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:18px 0 6px;border-top:1px solid ${LINE}">${l.facts
-        .map(
-          (fact) =>
-            `<tr><td style="padding:9px 0;border-bottom:1px solid ${LINE};color:${MUTED};font-size:14px">${esc(fact.label)}</td><td align="right" style="padding:9px 0 9px 12px;border-bottom:1px solid ${LINE};color:${INK};font-size:14px;font-weight:600">${esc(fact.value)}</td></tr>`,
-        )
-        .join('')}</table>`
-    : '';
+  const rows = l.factsRaw ?? (l.facts?.length ? factsRowsHtml(l.facts) : '');
+  const facts = rows ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:18px 0 6px;border-top:1px solid ${LINE}">${rows}</table>` : '';
 
   const button = l.button
     ? `<table role="presentation" cellpadding="0" cellspacing="0" style="margin:22px 0 4px"><tr><td style="background:${TEAL};border-radius:12px"><a href="${esc(l.button.url)}" style="display:inline-block;padding:13px 22px;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none">${esc(l.button.label)}</a></td></tr></table>
@@ -209,7 +216,15 @@ export interface OrderEmailData {
   items?: Array<{ name: string; quantity: number; unitLabel: string; lineTotalCents: number }>;
   /** Why a cancellation happened, when it was not the buyer's own doing. */
   cause?: 'unpaid';
+  // The three below are only used to render a Resend TEMPLATE, where these pieces arrive as ready-made variables (a
+  // greeting, the formatted total, the receipt rows as HTML). Ordinary sending leaves them out.
+  greeting?: string;
+  total?: string;
+  receiptRows?: string;
 }
+
+/** The total as shown in the text: the formatted override when rendering a template, else money. */
+const totalText = (d: OrderEmailData): string => d.total ?? usd(d.totalCents);
 
 interface OrderCopy {
   subject: (n: string) => string;
@@ -265,7 +280,7 @@ const ORDER_COPY: Record<EmailLocale, Record<OrderEmailKind, OrderCopy>> = {
       subject: (n) => `Te devolvimos el dinero del pedido #${n}`,
       heading: () => 'Te devolvimos tu dinero',
       paragraphs: (d) => [
-        `Reembolsamos ${usd(d.totalCents)} del pedido #${d.orderNumber}.`,
+        `Reembolsamos ${totalText(d)} del pedido #${d.orderNumber}.`,
         'Según el método que usaste, puede tardar unos días en aparecer en tu cuenta. Si pasa una semana y no lo ves, escríbenos.',
       ],
       button: 'Ver el pedido',
@@ -275,7 +290,7 @@ const ORDER_COPY: Record<EmailLocale, Record<OrderEmailKind, OrderCopy>> = {
       heading: () => 'Tu pedido sigue esperando el pago',
       paragraphs: (d) => [
         `El pedido #${d.orderNumber} para ${d.recipientName} todavía no está pagado. Si no lo recibimos pronto, se cancelará solo (en aproximadamente un día).`,
-        `Total a pagar: ${usd(d.totalCents)}. Si ya lo enviaste, avísanos en la página del pedido y lo revisamos.`,
+        `Total a pagar: ${totalText(d)}. Si ya lo enviaste, avísanos en la página del pedido y lo revisamos.`,
       ],
       button: 'Ver cómo pagar',
     },
@@ -325,7 +340,7 @@ const ORDER_COPY: Record<EmailLocale, Record<OrderEmailKind, OrderCopy>> = {
       subject: (n) => `We refunded your order #${n}`,
       heading: () => 'We refunded your money',
       paragraphs: (d) => [
-        `We refunded ${usd(d.totalCents)} for order #${d.orderNumber}.`,
+        `We refunded ${totalText(d)} for order #${d.orderNumber}.`,
         'Depending on the method you used, it can take a few days to show in your account. If a week passes and you do not see it, write to us.',
       ],
       button: 'View the order',
@@ -335,7 +350,7 @@ const ORDER_COPY: Record<EmailLocale, Record<OrderEmailKind, OrderCopy>> = {
       heading: () => 'Your order is still waiting for payment',
       paragraphs: (d) => [
         `Order #${d.orderNumber} for ${d.recipientName} is not paid yet. If we do not receive it soon, it will cancel itself (in about a day).`,
-        `Amount to pay: ${usd(d.totalCents)}. If you already sent it, tell us on the order page and we will check.`,
+        `Amount to pay: ${totalText(d)}. If you already sent it, tell us on the order page and we will check.`,
       ],
       button: 'See how to pay',
     },
@@ -347,26 +362,34 @@ const ORDER_LABELS = {
   en: { hello: (name: string | null) => (name ? `Hi ${name}.` : 'Hi.'), subtotal: 'Products', delivery: 'Delivery', total: 'Total', free: 'Free' },
 } as const;
 
+/** "Hola Ana." / "Hi Ana." (or without the name). */
+export const orderGreeting = (locale: EmailLocale, name: string | null): string => ORDER_LABELS[locale].hello(name);
+
+/** The receipt lines of an order-placed email. */
+export function orderFacts(locale: EmailLocale, data: OrderEmailData): Fact[] {
+  const label = ORDER_LABELS[locale];
+  const facts: Fact[] = [];
+  for (const item of data.items ?? []) {
+    facts.push({ label: `${item.name} × ${item.quantity} · ${item.unitLabel}`, value: usd(item.lineTotalCents) });
+  }
+  if (data.subtotalCents !== undefined) facts.push({ label: label.subtotal, value: usd(data.subtotalCents) });
+  if (data.deliveryFeeCents !== undefined) facts.push({ label: label.delivery, value: data.deliveryFeeCents === 0 ? label.free : usd(data.deliveryFeeCents) });
+  facts.push({ label: label.total, value: usd(data.totalCents) });
+  return facts;
+}
+
 export function orderEmail(kind: OrderEmailKind, locale: EmailLocale, brand: EmailBrand, data: OrderEmailData): RenderedEmail {
   const copy = ORDER_COPY[locale][kind];
   const label = ORDER_LABELS[locale];
-  // A receipt is shown when the order is placed: what is in the box and what it costs.
-  const facts: Fact[] = [];
-  if (kind === 'placed') {
-    for (const item of data.items ?? []) {
-      facts.push({ label: `${item.name} × ${item.quantity} · ${item.unitLabel}`, value: usd(item.lineTotalCents) });
-    }
-    if (data.subtotalCents !== undefined) facts.push({ label: label.subtotal, value: usd(data.subtotalCents) });
-    if (data.deliveryFeeCents !== undefined) facts.push({ label: label.delivery, value: data.deliveryFeeCents === 0 ? label.free : usd(data.deliveryFeeCents) });
-    facts.push({ label: label.total, value: usd(data.totalCents) });
-  }
   const { html, text } = renderLayout({
     locale,
     brand,
     preheader: copy.paragraphs(data)[0] ?? copy.heading(data.orderNumber),
     heading: copy.heading(data.orderNumber),
-    paragraphs: [label.hello(data.buyerName), ...copy.paragraphs(data)],
-    facts,
+    paragraphs: [data.greeting ?? label.hello(data.buyerName), ...copy.paragraphs(data)],
+    // A receipt is shown when the order is placed: what is in the box and what it costs.
+    facts: kind === 'placed' && data.receiptRows === undefined ? orderFacts(locale, data) : undefined,
+    factsRaw: kind === 'placed' ? data.receiptRows : undefined,
     button: { label: copy.button, url: data.orderUrl },
     small: copy.small,
   });

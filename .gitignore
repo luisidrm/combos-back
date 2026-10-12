@@ -15,3 +15,6 @@ coverage/
 
 # Rendered by npm run emails:preview
 email-previews/
+
+# Rendered by npm run emails:export (Resend template files)
+email-templates/

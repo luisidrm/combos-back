@@ -71,6 +71,10 @@ const envSchema = z.object({
   GOOGLE_CLIENT_ID: optionalText,
   GOOGLE_CLIENT_SECRET: optionalText,
 
+  // How emails are dressed: "inline" (default) sends the HTML our code renders; "resend" sends through the templates
+  // uploaded to Resend (docs/EMAIL-TEMPLATES.md), so their words and look can be edited there without a deploy.
+  EMAIL_TEMPLATES: z.enum(['inline', 'resend']).default('inline'),
+
   RESEND_API_KEY: z.string().min(1),
   EMAIL_FROM: z.string().min(1).default('onboarding@resend.dev'),
   // Really send emails through Resend? Unset = only in production; elsewhere the message is just logged.

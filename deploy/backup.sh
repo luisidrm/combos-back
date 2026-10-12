@@ -9,7 +9,9 @@
 #   10 3 * * * cd /opt/combo-shop/back/deploy && ./backup.sh >> backups/backup.log 2>&1
 set -eu
 cd "$(dirname "$0")"
-. ./.env.production
+# Reads one value from .env.production without running it as a script (a value such as Pa'Casa <x@y> would break "source").
+env_value() { grep -E "^$1=" .env.production | head -n 1 | cut -d= -f2-; }
+POSTGRES_USER="$(env_value POSTGRES_USER)"
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DIR="backups/$STAMP"
